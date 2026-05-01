@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>HubeAli AI Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="ha-widget">
+    <div id="ha-header">
+        <div id="ha-header-icon">☽</div>
+        <div>
+            <div id="ha-header-title">HubeAli Knowledge Search</div>
+            <div id="ha-header-sub">Ask about hadith and Islamic knowledge</div>
+        </div>
+    </div>
+    <div id="ha-source-bar">
+        <button class="ha-src-btn active" onclick="setSource(this,'all')">All Sources</button>
+        <button class="ha-src-btn" onclick="setSource(this,'articles')">Articles</button>
+        <button class="ha-src-btn" onclick="setSource(this,'books')">Books</button>
+    </div>
+    <div id="ha-messages">
+        <!-- Messages will appear here -->
+    </div>
+    <div id="ha-input-area">
+        <textarea id="ha-input" placeholder="Ask a question..." onkeydown="handleKey(event)"></textarea>
+        <button id="ha-send" onclick="sendMsg()">
+            <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+        </button>
+    </div>
+</div>
+<script src="/static/script.js"></script>
+</body>
+</html>
