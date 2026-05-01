@@ -1,0 +1,3 @@
+fastenv/
+__pycache__/
+.env
