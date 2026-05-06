@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <title>HubeAli AI Chat</title>
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}">
 </head>
 <body>
 <div id="ha-widget">
@@ -20,8 +20,8 @@
         <button class="ha-src-btn" onclick="setSource(this,'books')">Books</button>
     </div>
     <div id="ha-messages">
-        <!-- Messages will appear here -->
-    </div>
+        <!--  Messages will appear here --> 
+     </div>
     <div id="ha-input-area">
         <textarea id="ha-input" placeholder="Ask a question..." onkeydown="handleKey(event)"></textarea>
         <button id="ha-send" onclick="sendMsg()">
@@ -31,4 +31,4 @@
 </div>
 <script src="/static/script.js"></script>
 </body>
-</html>
+</html> 
