@@ -1,3 +1,8 @@
 fastenv/
 __pycache__/
 .env
+.vscode
+tmp/
+qdrant_storage/
+*.pyc
+.pytest_cache/

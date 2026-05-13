@@ -1,22 +1,42 @@
-import os
-from dotenv import load_dotenv
-from groq import Groq
-from neo4j import GraphDatabase
-from langchain_huggingface import HuggingFaceEmbeddings
+from pathlib import Path
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-load_dotenv()
 
-class Config:
-    NEO4J_URI = os.getenv("NEO4J_URL")
-    NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
-    NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-    EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-    GENERATION_MODEL = "llama-3.3-70b-versatile"
-    VECTOR_INDEX_NAME = "vector"
-    FULLTEXT_INDEX_NAME = "ftChunk"
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
-# Initialize Shared Clients
-client = Groq(api_key=Config.GROQ_API_KEY)
-driver = GraphDatabase.driver(Config.NEO4J_URI, auth=(Config.NEO4J_USERNAME, Config.NEO4J_PASSWORD))
-hf_embeddings = HuggingFaceEmbeddings(model_name=Config.EMBEDDING_MODEL)
+    # Qdrant
+    QDRANT_URL: str = "http://localhost:6333"
+    QDRANT_API_KEY: str | None = None
+    QDRANT_COLLECTION: str = "hub-e-ali"
+
+    # OpenRouter
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_MODEL: str = "anthropic/claude-3.5-sonnet"
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+
+    # API auth
+    API_KEY: str = "change-me-in-production"
+
+    # Local working dirs
+    UPLOAD_DIR: str = "./tmp/rag_uploads"
+
+    # Embedding device: auto | cuda | cpu
+    EMBEDDING_DEVICE: str = "auto"
+
+    # Retrieval tuning
+    RETRIEVAL_TOP_K: int = 20
+    RERANK_TOP_K: int = 5
+
+    @property
+    def upload_dir_path(self) -> Path:
+        p = Path(self.UPLOAD_DIR).resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+
+settings = Settings()

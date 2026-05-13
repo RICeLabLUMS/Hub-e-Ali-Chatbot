@@ -1,190 +1,119 @@
+"""
+Bulk PDF loader.
+
+Two modes:
+  --via-api   (default): POST each PDF to /api/ingest/pdf (server must be running)
+  --offline           : drive the ingestion pipeline directly, no HTTP
+
+Examples:
+  python scripts/load_documents.py
+  python scripts/load_documents.py --offline
+  python scripts/load_documents.py --folder data --api http://localhost:8000
+"""
+
+import argparse
+import asyncio
+import logging
 import os
-import re
-import hashlib
+import sys
 from pathlib import Path
-from typing import List, Dict, Any, Optional
 
-import fitz  # PyMuPDF
-from neo4j import GraphDatabase
-from langchain_huggingface import HuggingFaceEmbeddings
-from dotenv import load_dotenv
+import httpx
 
-# ==========================================================
-# CONFIG & INITIALIZATION
-# ==========================================================
-load_dotenv()
+# Make `app.*` importable when run from repo root
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-NEO4J_URI = os.getenv("NEO4J_URL")
-NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger("loader")
 
-EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-EMBEDDING_DIM = 1024
-VECTOR_INDEX_NAME = "vector"  # Match your FastAPI index name
-FULLTEXT_INDEX_NAME = "ftChunk"
 
-# Initialize Models and Drivers
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD), connection_timeout=30)
-hf_embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+async def upload_via_api(folder: Path, api_url: str, api_key: str) -> None:
+    pdfs = sorted(folder.glob("*.pdf"))
+    if not pdfs:
+        logger.warning(f"No PDFs found in {folder}")
+        return
 
-# ==========================================================
-# LANGUAGE & NORMALIZATION FUNCTIONS
-# ==========================================================
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        for pdf in pdfs:
+            logger.info(f"Uploading {pdf.name}...")
+            with pdf.open("rb") as f:
+                resp = await client.post(
+                    f"{api_url}/api/ingest/pdf",
+                    headers={"X-API-Key": api_key},
+                    files={"file": (pdf.name, f, "application/pdf")},
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            doc_id = data["doc_id"]
+            logger.info(f"  queued as doc_id={doc_id}")
 
-def detect_language_simple(text: str) -> str:
-    """Heuristic to detect language if Lingua is not installed."""
-    if not text: return "unknown"
-    arabic_script_count = len(re.findall(r"[\u0600-\u06FF]", text))
-    latin_count = len(re.findall(r"[A-Za-z]", text))
-    urdu_specific = len(re.findall(r"[ٹڈڑںےہکگچپژ]", text))
+            # Poll status
+            while True:
+                await asyncio.sleep(3)
+                s = await client.get(
+                    f"{api_url}/api/ingest/status/{doc_id}",
+                    headers={"X-API-Key": api_key},
+                )
+                if s.status_code != 200:
+                    logger.error(f"  status check failed: {s.text}")
+                    break
+                state = s.json().get("state")
+                logger.info(f"  {pdf.name}: {state}")
+                if state in ("done", "failed"):
+                    if state == "failed":
+                        logger.error(f"  error: {s.json().get('error')}")
+                    break
 
-    if arabic_script_count > latin_count:
-        return "ur" if urdu_specific > 2 else "ar"
-    return "en" if latin_count > 0 else "unknown"
 
-def normalize_for_search(text: str, lang: str) -> str:
-    """Aggressive normalization for full-text search indexes."""
-    if not text: return ""
-    text = text.lower().strip()
-    if lang == "ar":
-        text = re.sub("[إأآٱا]", "ا", text)
-        text = text.replace("ة", "ه").replace("ى", "ي")
-    elif lang == "ur":
-        text = text.replace("ك", "ک").replace("ي", "ی").replace("ة", "ہ")
-    return text
+async def load_offline(folder: Path) -> None:
+    """Run the full ingestion pipeline in-process — no HTTP server needed."""
+    from app.core.dependencies import get_embedder, get_pdf_extractor, get_qdrant_client
+    from app.services.ingestion.chunker import MultilingualChunker
+    from app.services.ingestion.indexer import QdrantIndexer
+    from app.services.ingestion.language_detector import detect_language
+    from app.services.qdrant_setup import setup_collection
 
-# ==========================================================
-# EXTRACTION & CHUNKING FUNCTIONS
-# ==========================================================
+    setup_collection(get_qdrant_client(), recreate=False)
 
-def read_pdf(file_path: str) -> List[Dict[str, Any]]:
-    """Extracts text page by page using PyMuPDF."""
-    pages = []
-    doc = fitz.open(file_path)
-    for i, page in enumerate(doc):
-        text = page.get_text("text").strip()
-        if text:
-            lang = detect_language_simple(text)
-            pages.append({
-                "page": i + 1,
-                "text": text,
-                "language": lang
-            })
-    return pages
-     
-def chunk_text(text: str, chunk_size: int = 1500, overlap: int = 200) -> List[str]:
-    """Simple character-based chunking with overlap."""
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
-    return chunks
+    extractor = get_pdf_extractor()
+    embedder = get_embedder()
+    chunker = MultilingualChunker(embedding_model=embedder.dense_model)
+    indexer = QdrantIndexer(client=get_qdrant_client(), embedder=embedder)
 
-# ==========================================================
-# NEO4J STORAGE FUNCTIONS
-# ==========================================================
+    pdfs = sorted(folder.glob("*.pdf"))
+    if not pdfs:
+        logger.warning(f"No PDFs found in {folder}")
+        return
 
-def create_indexes():
-    """Sets up Vector and Fulltext indexes in Neo4j with explicit session management."""
-    try:
-        with driver.session() as session:
-            # Vector Index[cite: 1]
-            session.run(f"""
-                CREATE VECTOR INDEX {VECTOR_INDEX_NAME} IF NOT EXISTS
-                FOR (c:Chunk) ON (c.embedding)
-                OPTIONS {{indexConfig: {{
-                    `vector.dimensions`: {EMBEDDING_DIM},
-                    `vector.similarity_function`: 'cosine'
-                }}}}
-            """)
-            # Fulltext Index[cite: 1]
-            session.run(f"""
-                CREATE FULLTEXT INDEX {FULLTEXT_INDEX_NAME} IF NOT EXISTS
-                FOR (c:Chunk) ON EACH [c.text_normalized, c.title]
-            """)
-            print("Indexes created or verified successfully.")
-    except Exception as e:
-        print(f"Failed to create indexes. Connection Error: {e}")
+    for pdf in pdfs:
+        doc_id = pdf.stem.replace(" ", "_")[:32]
+        logger.info(f"Processing {pdf.name} as doc_id={doc_id}...")
 
-def store_in_neo4j(chunks_data: List[Dict[str, Any]], file_name: str):
-    """Batches and stores chunks and embeddings into Neo4j."""
-    query = """
-    UNWIND $rows AS row
-    MERGE (c:Chunk {chunk_id: row.chunk_id})
-    SET c.text = row.text,
-        c.text_normalized = row.text_normalized,
-        c.embedding = row.embedding,
-        c.page = row.page,
-        c.title = row.title,
-        c.language = row.language
-    """
-    rows = []
-    for i, chunk in enumerate(chunks_data):
-        # Generate embedding
-        emb = hf_embeddings.embed_query(chunk["text"])
-        
-        rows.append({
-            "chunk_id": f"{hashlib.md5(file_name.encode()).hexdigest()}_{i}",
-            "text": chunk["text"],
-            "text_normalized": normalize_for_search(chunk["text"], chunk["language"]),
-            "embedding": emb,
-            "page": chunk["page"],
-            "title": file_name,
-            "language": chunk["language"]
-        })
-
-    with driver.session() as session:
-        session.run(query, rows=rows)
-
-# ==========================================================
-# MAIN EXECUTION
-# ==========================================================
-
-def main(folder_path: str):
-    create_indexes() # Remove from here
-    path = Path(folder_path)
-    
-    for pdf_file in path.glob("*.pdf"):
-        print(f"Processing {pdf_file.name}...")
-        pages = read_pdf(str(pdf_file))
-        
-        all_chunks = []
+        pages = extractor.extract(str(pdf))
         for p in pages:
-            text_chunks = chunk_text(p["text"])
-            for tc in text_chunks:
-                all_chunks.append({
-                    "text": tc,
-                    "page": p["page"],
-                    "language": p["language"]
-                })
-        
-        store_in_neo4j(all_chunks, pdf_file.name)
-        print(f"Finished {pdf_file.name}")
+            p.language = detect_language(p.text)
+
+        chunks = chunker.chunk_pages(pages, doc_id=doc_id)
+        total = indexer.index_chunks(chunks, doc_id=doc_id)
+        logger.info(f"  indexed {total} chunks")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--folder", default="data", help="Folder containing PDFs")
+    parser.add_argument("--api", default="http://localhost:8000", help="API base URL")
+    parser.add_argument("--api-key", default=os.environ.get("API_KEY", "change-me-in-production"))
+    parser.add_argument("--offline", action="store_true", help="Run ingestion in-process")
+    args = parser.parse_args()
+
+    folder = Path(args.folder)
+    folder.mkdir(exist_ok=True)
+
+    if args.offline:
+        asyncio.run(load_offline(folder))
+    else:
+        asyncio.run(upload_via_api(folder, args.api, args.api_key))
+
 
 if __name__ == "__main__":
-    # Ensure you have a folder named 'data' with your PDFs
-    if not os.path.exists("data"):
-        os.makedirs("data")
-    main("data")
-
-
-
-# from neo4j import GraphDatabase
-# from dotenv import load_dotenv
-# load_dotenv()
-# import os
-
-# uri = os.getenv('NEO4J_URL')
-# user = os.getenv('NEO4J_USERNAME')
-# password = os.getenv('NEO4J_PASSWORD')
-# # print(uri)
-# # print(user)
-# # print(password)
-
-# driver = GraphDatabase.driver(uri, auth=(user, password))
-
-# with driver.session() as session:
-#     result = session.run("RETURN 1")
-#     print(result.single())
+    main()
