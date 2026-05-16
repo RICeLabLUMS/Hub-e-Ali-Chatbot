@@ -64,6 +64,9 @@ class WordPressClient:
         # Browser-like headers - some WAFs (Cloudflare, Wordfence) drop the
         # connection on non-browser User-Agents and reject responses to clients
         # that don't send the usual Accept-* set.
+        # Note: 'br' (Brotli) intentionally omitted because httpx requires the
+        # 'brotli' package to decode it, and the WP REST API will gladly serve
+        # gzip/deflate instead - which httpx handles natively.
         headers = {
             "User-Agent": user_agent or (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -71,7 +74,7 @@ class WordPressClient:
             ),
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Encoding": "gzip, deflate",
         }
         self._client = httpx.Client(
             base_url=self.base_url,
@@ -145,14 +148,26 @@ class WordPressClient:
 
         try:
             info = resp.json()
-            name = info.get("name", "<unknown>")
-            namespaces = info.get("namespaces") or []
-            logger.info(
-                f"WP ping ok: site={name!r} namespaces={len(namespaces)} "
-                f"({', '.join(namespaces[:5])}{'...' if len(namespaces) > 5 else ''})"
-            )
-        except ValueError:
-            logger.info(f"WP ping ok: {self.base_url}{url} returned 200 (non-JSON body)")
+        except UnicodeDecodeError as e:
+            # Almost certainly a content-encoding (Brotli) the client can't decode.
+            ce = resp.headers.get("content-encoding", "<none>")
+            raise RuntimeError(
+                f"WordPress returned 200 but body could not be decoded "
+                f"(content-encoding={ce!r}): {e}"
+            ) from e
+        except ValueError as e:
+            ct = resp.headers.get("content-type", "<unknown>")
+            raise RuntimeError(
+                f"WordPress {self.base_url}{url} returned 200 but body is not JSON "
+                f"(content-type={ct!r}, first 200 chars: {resp.text[:200]!r})"
+            ) from e
+
+        name = info.get("name", "<unknown>")
+        namespaces = info.get("namespaces") or []
+        logger.info(
+            f"WP ping ok: site={name!r} namespaces={len(namespaces)} "
+            f"({', '.join(namespaces[:5])}{'...' if len(namespaces) > 5 else ''})"
+        )
 
     def list_content(
         self,
@@ -212,13 +227,14 @@ class WordPressClient:
         self,
         modified_after: Optional[str] = None,
     ) -> Iterator[dict]:
+        # WP REST `media_type` accepts: image|video|audio|text|application.
+        # PDFs fall under "application"; we filter to application/pdf client-side
+        # so the query stays valid across WP versions/plugins.
         for item in self.list_content(
             "wp/v2/media",
             modified_after=modified_after,
-            extra_params={"media_type": "file", "mime_type": "application/pdf"},
+            extra_params={"media_type": "application"},
         ):
-            # Belt and suspenders - the mime_type filter is sometimes ignored
-            # depending on WP version / plugins.
             if (item.get("mime_type") or "").lower() == "application/pdf":
                 yield item
 
