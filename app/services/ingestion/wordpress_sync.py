@@ -229,6 +229,13 @@ class WordPressSync:
         report: ContentTypeReport,
         touched: set[str],
     ) -> None:
+        # Fail-stop watermark: advance only while the run is unbroken. If item N
+        # fails, items after N succeed but their modified_gmt does NOT advance
+        # the watermark - otherwise we'd leapfrog the failed item and never
+        # retry it on a subsequent run.
+        safe_watermark: Optional[str] = None
+        had_failure = False
+
         for item in wp.list_content(route, modified_after=modified_after):
             report.fetched += 1
             item_id = item.get("id")
@@ -239,14 +246,24 @@ class WordPressSync:
                 chunks_indexed = self._process_text_item(item, doc_prefix)
                 report.indexed += 1
                 report.chunks += chunks_indexed
-                if modified_gmt:
-                    self.state.set(state_key, modified_gmt)
+                if not had_failure and modified_gmt:
+                    safe_watermark = modified_gmt
             except Exception as e:
                 logger.error(
                     f"WP sync [{state_key}] item id={item_id} failed: {describe_exception(e)}"
                 )
                 logger.debug("Full traceback:", exc_info=True)
                 report.errors += 1
+                had_failure = True
+
+        if safe_watermark:
+            self.state.set(state_key, safe_watermark)
+        if had_failure:
+            logger.warning(
+                f"WP sync [{state_key}]: watermark held at {safe_watermark!r} "
+                "due to earlier failures - successful items past the first failure "
+                "will be retried on the next run."
+            )
 
     def _process_text_item(self, item: dict, doc_prefix: str) -> int:
         """Convert one WP post/page/CPT into chunks and upsert."""
@@ -296,6 +313,10 @@ class WordPressSync:
         report: ContentTypeReport,
         touched: set[str],
     ) -> None:
+        # See note on fail-stop watermark in _sync_text_route - same logic here.
+        safe_watermark: Optional[str] = None
+        had_failure = False
+
         for item in wp.list_media_pdfs(modified_after=modified_after):
             report.fetched += 1
             item_id = item.get("id")
@@ -306,6 +327,7 @@ class WordPressSync:
             if not source_url:
                 logger.warning(f"WP media id={item_id} has no source_url; skipping")
                 report.errors += 1
+                had_failure = True
                 continue
 
             try:
@@ -320,12 +342,22 @@ class WordPressSync:
                 )
                 report.indexed += 1
                 report.chunks += chunks_indexed
-                if modified_gmt:
-                    self.state.set("media", modified_gmt)
+                if not had_failure and modified_gmt:
+                    safe_watermark = modified_gmt
             except Exception as e:
                 logger.error(f"WP media id={item_id} failed: {describe_exception(e)}")
                 logger.debug("Full traceback:", exc_info=True)
                 report.errors += 1
+                had_failure = True
+
+        if safe_watermark:
+            self.state.set("media", safe_watermark)
+        if had_failure:
+            logger.warning(
+                f"WP sync [media]: watermark held at {safe_watermark!r} "
+                "due to earlier failures - successful items past the first failure "
+                "will be retried on the next run."
+            )
 
     def _process_pdf_bytes(
         self,
