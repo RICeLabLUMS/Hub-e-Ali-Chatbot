@@ -10,6 +10,14 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+class _ProviderError(RuntimeError):
+    """OpenRouter returned a parseable error envelope (often with HTTP 200).
+    Distinguished from transport errors so the retry loop can treat it as a
+    transient failure but the final message preserves the provider's error
+    text for ops debugging."""
+
+
 # Retry config for transient LLM failures (5xx, network blips, rate limits).
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.5  # seconds; doubled on each retry
@@ -69,11 +77,25 @@ class OpenRouterClient:
                 temperature=0.2,
                 response_format={"type": "json_object"},
             )
+        except _ProviderError as e:
+            # OpenRouter returned an error envelope (often as HTTP 200). The
+            # message includes the provider's own error text - log it intact
+            # so ops can tell "insufficient credits" from "model overloaded"
+            # from "content moderated" etc.
+            logger.error(f"OpenRouter answer call rejected by provider: {e}")
+            return {
+                "answer": (
+                    "The answer service is temporarily unavailable. "
+                    "Please try again in a moment."
+                ),
+                "citations": [],
+            }
         except Exception as e:
-            # Caller (chat endpoint) wraps no error handling around generate_answer;
-            # rather than 500 the user-facing endpoint, degrade gracefully with a
-            # plain message. The actual error is logged for ops visibility.
-            logger.error(f"OpenRouter generate_answer failed after retries: {e!r}")
+            # Network / transport / unexpected error.
+            logger.error(
+                f"OpenRouter answer call failed: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
             return {
                 "answer": (
                     "The answer service is temporarily unavailable. "
@@ -141,7 +163,9 @@ class OpenRouterClient:
             "X-Title": "HubeAli RAG",
         }
 
-        # Retry on transient failures: network errors, 429 rate limit, 5xx.
+        # Retry on transient failures: network errors, 429 rate limit, 5xx,
+        # and the OpenRouter "200 with error body" quirk where the provider
+        # routes the call to a backend that returns an error JSON inline.
         # 4xx other than 429 are non-retryable (bad request, auth).
         last_exc: Exception | None = None
         for attempt in range(1, _MAX_RETRIES + 1):
@@ -171,8 +195,17 @@ class OpenRouterClient:
                     )
                 else:
                     resp.raise_for_status()
-                    data = resp.json()
-                    return data["choices"][0]["message"]["content"]
+                    try:
+                        return self._extract_message_content(resp.json())
+                    except _ProviderError as pe:
+                        # 200-with-error - retryable (often transient provider
+                        # routing issues). Capture and retry; surfaces if all
+                        # attempts exhaust.
+                        last_exc = pe
+                        logger.warning(
+                            f"OpenRouter returned a 200 with error body "
+                            f"(attempt {attempt}/{_MAX_RETRIES}): {pe}"
+                        )
 
             if attempt < _MAX_RETRIES:
                 await asyncio.sleep(_BACKOFF_BASE * (2 ** (attempt - 1)))
@@ -181,6 +214,38 @@ class OpenRouterClient:
         if last_exc:
             raise last_exc
         raise RuntimeError("OpenRouter call failed after retries (last response was 5xx)")
+
+    @staticmethod
+    def _extract_message_content(data: dict) -> str:
+        """Pull the assistant message text out of an OpenRouter /chat/completions
+        response. Raises _ProviderError when the response is shaped like an
+        error envelope rather than a normal completion - the retry loop in
+        _chat treats this as a transient failure."""
+        # OpenRouter sometimes returns errors as HTTP 200 with one of these
+        # shapes instead of the normal {"choices": [...]} envelope:
+        #   {"error": {"message": "...", "code": 402}}
+        #   {"error": "string message"}
+        err = data.get("error") if isinstance(data, dict) else None
+        if err is not None:
+            if isinstance(err, dict):
+                msg = err.get("message") or str(err)
+                code = err.get("code")
+                code_part = f" [{code}]" if code is not None else ""
+                raise _ProviderError(f"OpenRouter API error{code_part}: {msg}")
+            raise _ProviderError(f"OpenRouter API error: {err}")
+
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not choices:
+            # Shape we don't recognize - surface a snippet so ops can diagnose.
+            snippet = str(data)[:300]
+            raise _ProviderError(f"OpenRouter response missing 'choices': {snippet}")
+
+        try:
+            return choices[0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise _ProviderError(
+                f"OpenRouter response shape unexpected: {e!r}; data={str(data)[:300]}"
+            ) from e
 
     @staticmethod
     def _format_context(chunks: list[dict]) -> str:
