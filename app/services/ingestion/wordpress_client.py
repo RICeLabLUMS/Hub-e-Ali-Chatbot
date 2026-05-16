@@ -199,16 +199,20 @@ class WordPressClient:
 
             resp = self._get_with_retry(f"/wp-json/{route.lstrip('/')}", params)
 
-            # WordPress returns 400 with code "rest_post_invalid_page_number"
-            # once you walk past the last page. Treat that as a clean stop.
-            if resp.status_code == 400:
-                try:
-                    code = resp.json().get("code", "")
-                except Exception:
-                    code = ""
-                if code in ("rest_post_invalid_page_number", "rest_no_route"):
+            # WP returns 400/404 with structured JSON: { code, message, data: {...} }.
+            # rest_post_invalid_page_number fires after the last page - clean stop.
+            if 400 <= resp.status_code < 500:
+                body = self._safe_json(resp)
+                wp_code = (body or {}).get("code", "")
+                wp_msg = (body or {}).get("message", "")
+                if wp_code in ("rest_post_invalid_page_number", "rest_no_route"):
                     return
-                resp.raise_for_status()
+                raise httpx.HTTPStatusError(
+                    f"WP {resp.status_code} on {resp.url}: "
+                    f"code={wp_code!r} message={wp_msg!r}",
+                    request=resp.request,
+                    response=resp,
+                )
 
             resp.raise_for_status()
             items = resp.json()
@@ -230,10 +234,12 @@ class WordPressClient:
         # WP REST `media_type` accepts: image|video|audio|text|application.
         # PDFs fall under "application"; we filter to application/pdf client-side
         # so the query stays valid across WP versions/plugins.
+        # Attachments use post_status='inherit', not 'publish' - sending
+        # status=publish to /wp/v2/media returns 400.
         for item in self.list_content(
             "wp/v2/media",
             modified_after=modified_after,
-            extra_params={"media_type": "application"},
+            extra_params={"media_type": "application", "status": "inherit"},
         ):
             if (item.get("mime_type") or "").lower() == "application/pdf":
                 yield item
@@ -243,6 +249,15 @@ class WordPressClient:
         resp = self._get_with_retry(source_url, params=None, absolute=True)
         resp.raise_for_status()
         return resp.content
+
+    @staticmethod
+    def _safe_json(resp: httpx.Response) -> Optional[dict]:
+        """Best-effort JSON parse; returns None on any error."""
+        try:
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
 
     def _get_with_retry(
         self,
