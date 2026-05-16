@@ -82,6 +82,14 @@ def main() -> None:
              "the inventory before running a real sync.",
     )
     parser.add_argument(
+        "--linked-pdfs-only",
+        action="store_true",
+        help="Bulk-ingest just the linked PDFs: iterate text content only to "
+             "discover anchors, then download and index each unique PDF. Does "
+             "NOT re-chunk text posts/pages or advance their watermarks. "
+             "Useful for first-time PDF ingestion when text is already indexed.",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable DEBUG logging (includes httpx wire-level traces).",
@@ -100,6 +108,7 @@ def main() -> None:
             full_resync=args.full_resync,
             prune=args.prune,
             list_linked_pdfs_only=args.list_linked_pdfs,
+            linked_pdfs_only=args.linked_pdfs_only,
         )
     except KeyboardInterrupt:
         logger.warning("Interrupted.")

@@ -141,6 +141,7 @@ class WordPressSync:
         full_resync: bool = False,
         prune: bool = False,
         list_linked_pdfs_only: bool = False,
+        linked_pdfs_only: bool = False,
     ) -> SyncReport:
         """
         Run one sync pass.
@@ -152,9 +153,13 @@ class WordPressSync:
         prune: if True, after a successful run delete any wp-* doc_ids that
                exist in Qdrant but were not visited this run.
                Implies full_resync.
-        list_linked_pdfs_only: audit mode - discover linked PDFs across all
-               currently-published WP content but neither index nor write state.
-               Forces full_resync, disables media sync, disables prune.
+        list_linked_pdfs_only: audit mode - iterate text content only to
+               harvest PDF anchors; print the dedupe'd list and exit.
+               Skips text re-indexing, media, watermarks, and writes to Qdrant.
+        linked_pdfs_only: ingest just the linked PDFs - iterate text content
+               only to harvest PDF anchors, then download and index each unique
+               PDF. Does NOT re-index text content or advance text watermarks,
+               so post/page chunks remain as they are.
         """
         report = SyncReport()
         wanted = self._resolve_content_types(content_types)
@@ -166,14 +171,16 @@ class WordPressSync:
             logger.info("prune=True forces full_resync=True (orphan detection requires a complete pass)")
             full_resync = True
 
-        if list_linked_pdfs_only:
-            # Audit mode: scan all current text content for PDF links; don't ingest
-            # anything, don't write state, don't prune. Drop media from scope (it's
-            # unrelated to linked-PDF discovery and wastes a fetch).
-            full_resync = True
-            prune = False
+        # Both PDF-focused modes share the same "iterate text content for anchors
+        # only, do not re-index posts/pages, do not advance text watermarks" path.
+        # They differ only in whether the drain phase downloads + indexes.
+        text_discovery_only = list_linked_pdfs_only or linked_pdfs_only
+        if text_discovery_only:
             wanted = [k for k in wanted if k != "media"]
-            logger.info("list-linked-pdfs mode: dry-run discovery, no writes")
+            if list_linked_pdfs_only:
+                logger.info("list-linked-pdfs mode: dry-run discovery, no writes")
+            else:
+                logger.info("linked-pdfs-only mode: discover anchors and ingest PDFs only")
 
         user_display = settings.WORDPRESS_USERNAME or "<none>"
         auth_display = "app-password" if settings.WORDPRESS_APP_PASSWORD else "anonymous"
@@ -193,11 +200,16 @@ class WordPressSync:
             and bool(text_types_in_scope)
         )
 
-        # Capture pre-existing wp-* doc_ids (scoped to the prefixes we're syncing)
-        # so we can identify orphans after the pass.
-        prefixes_in_scope: list[str] = [self._doc_prefix_for_key(k) for k in wanted]
-        if do_linked_pdfs:
-            prefixes_in_scope.append("wp-linkedpdf-")
+        # Capture pre-existing doc_ids in scope so we can identify orphans after
+        # the pass. In PDF-focused modes the scope is just wp-linkedpdf-, because
+        # text content isn't visited for indexing in those modes (so its doc_ids
+        # would never end up in `touched` and would all be flagged as orphans).
+        if text_discovery_only:
+            prefixes_in_scope: list[str] = ["wp-linkedpdf-"]
+        else:
+            prefixes_in_scope = [self._doc_prefix_for_key(k) for k in wanted]
+            if do_linked_pdfs:
+                prefixes_in_scope.append("wp-linkedpdf-")
         existing_doc_ids: set[str] = set()
         if prune:
             existing_doc_ids = self._list_doc_ids_with_prefixes(prefixes_in_scope)
@@ -221,10 +233,21 @@ class WordPressSync:
 
             for key in wanted:
                 watermark = None if full_resync else (since or self.state.get(key))
-                logger.info(f"WP sync [{key}] starting (modified_after={watermark!r})")
+                if text_discovery_only:
+                    logger.info(f"WP discover [{key}] starting (anchors only)")
+                else:
+                    logger.info(f"WP sync [{key}] starting (modified_after={watermark!r})")
                 try:
                     if key == "media":
                         self._sync_media(wp, watermark, report.for_type(key), touched_doc_ids)
+                    elif text_discovery_only:
+                        route, doc_prefix = self._route_for(key)
+                        self._discover_pdfs_in_route(
+                            wp,
+                            route=route,
+                            doc_prefix=doc_prefix,
+                            report=report.for_type(key),
+                        )
                     else:
                         route, doc_prefix = self._route_for(key)
                         self._sync_text_route(
@@ -279,6 +302,30 @@ class WordPressSync:
         return report
 
     # ----------------------- text content (posts / pages / CPTs) -----------------------
+
+    def _discover_pdfs_in_route(
+        self,
+        wp: WordPressClient,
+        route: str,
+        doc_prefix: str,
+        report: ContentTypeReport,
+    ) -> None:
+        """
+        Iterate a text route only to harvest PDF anchors from each item's HTML.
+        Does NOT chunk, does NOT embed, does NOT advance the watermark, does
+        NOT touch Qdrant. Used by --list-linked-pdfs and --linked-pdfs-only.
+        """
+        for item in wp.list_content(route, modified_after=None):
+            report.fetched += 1
+            item_id = item.get("id")
+            raw_html = (item.get("content") or {}).get("rendered", "")
+            if not raw_html or item_id is None:
+                continue
+            self._collect_pdf_links(
+                raw_html,
+                host_url=item.get("link") or settings.WORDPRESS_URL,
+                host_doc_id=f"{doc_prefix}-{item_id}",
+            )
 
     def _sync_text_route(
         self,
