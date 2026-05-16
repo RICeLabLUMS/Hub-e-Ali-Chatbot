@@ -291,6 +291,19 @@ class WordPressSync:
 
             # After all text content is fetched, drain the linked-PDF queue.
             if do_linked_pdfs:
+                # Resurrect any previously-failed URLs so they get retried on
+                # this run (even if their host post hasn't changed since last
+                # sync). The failed-PDF list is persisted in the state file
+                # under a reserved key.
+                for failed_url in self.state.get_failed_pdfs():
+                    if failed_url not in self._linked_pdfs:
+                        self._linked_pdfs[failed_url] = {
+                            "url": failed_url,
+                            "anchor_text": None,
+                            "first_seen_in": "<previously-failed>",
+                            "referenced_by": ["<previously-failed>"],
+                        }
+
                 logger.info(f"WP sync [linked_pdfs] starting (dry_run={list_linked_pdfs_only})")
                 try:
                     self._process_linked_pdfs(
@@ -405,16 +418,27 @@ class WordPressSync:
         title = self._html_to_text((item.get("title") or {}).get("rendered", ""))
         raw_html = (item.get("content") or {}).get("rendered", "")
 
+        # Parse the body once and reuse the soup for both link extraction and
+        # text extraction (was: two BeautifulSoup parses per post, expensive
+        # on a 720-post sync).
+        body_soup = None
+        if raw_html:
+            try:
+                body_soup = BeautifulSoup(raw_html, "html.parser")
+            except Exception as e:
+                logger.warning(f"HTML parse failed for {doc_prefix}-{item_id}: {e}")
+                body_soup = None
+
         # Discover PDF links in the body BEFORE we strip HTML to plain text.
         # We dedupe across the whole sync run via self._linked_pdfs.
-        if settings.WORDPRESS_INGEST_LINKED_PDFS and raw_html:
-            self._collect_pdf_links(
-                raw_html,
+        if settings.WORDPRESS_INGEST_LINKED_PDFS and body_soup is not None:
+            self._collect_pdf_links_from_soup(
+                body_soup,
                 host_url=item.get("link") or settings.WORDPRESS_URL,
                 host_doc_id=f"{doc_prefix}-{item_id}",
             )
 
-        body = self._html_to_text(raw_html)
+        body = self._soup_to_text(body_soup) if body_soup is not None else ""
         body = body.strip()
         if not body:
             logger.info(f"  skip {doc_prefix}-{item_id} ({slug}): empty body")
@@ -439,12 +463,11 @@ class WordPressSync:
             logger.info(f"  skip {doc_id}: produced 0 chunks")
             return 0
 
-        # Clear prior chunks for this doc so shorter edits don't leave stale
-        # higher-indexed chunks behind (deterministic IDs only overwrite where
-        # the new chunk_id matches an old one).
-        self._delete_doc_chunks(doc_id)
-
-        total = self.indexer.index_chunks(chunks, doc_id=doc_id)
+        # Atomic re-index: upsert new chunks first (overwrite by uuid5 ID),
+        # then prune any leftover chunks with this doc_id whose chunk_id isn't
+        # in the new set. If indexing fails, old content stays in Qdrant
+        # rather than disappearing.
+        total = self.indexer.index_chunks_replacing(chunks, doc_id=doc_id)
         logger.info(f"  indexed {doc_id} ({slug}): {total} chunks")
         return total
 
@@ -563,8 +586,8 @@ class WordPressSync:
                 logger.info(f"  skip {doc_id}: produced 0 chunks")
                 return 0
 
-            self._delete_doc_chunks(doc_id)
-            total = self.indexer.index_chunks(chunks, doc_id=doc_id)
+            # Atomic re-index: see note in _process_text_item.
+            total = self.indexer.index_chunks_replacing(chunks, doc_id=doc_id)
             logger.info(f"  indexed {doc_id}: {total} chunks")
             return total
         finally:
@@ -637,11 +660,50 @@ class WordPressSync:
     def _list_doc_ids_with_prefixes(self, prefixes: list[str]) -> set[str]:
         """
         Return the set of distinct doc_ids in the collection whose value
-        starts with any of the given prefixes. Uses scroll because Qdrant's
-        keyword index doesn't support prefix match - we read each point's
-        doc_id and filter in Python. With the doc_id payload index this is
-        cheap (no vector deserialization).
+        starts with any of the given prefixes.
+
+        Prefers Qdrant's facet API (qdrant-client >=1.10), which returns
+        distinct values for an indexed payload key in one cheap call. Falls
+        back to a full scroll for older qdrant-client versions.
         """
+        seen = self._facet_doc_ids(prefixes)
+        if seen is not None:
+            return seen
+        return self._scroll_doc_ids(prefixes)
+
+    def _facet_doc_ids(self, prefixes: list[str]) -> Optional[set[str]]:
+        """Fast path using payload facet. Returns None if facet API isn't
+        available so the caller can fall back to scroll."""
+        facet = getattr(self.qdrant, "facet", None)
+        if not callable(facet):
+            return None
+        try:
+            # Cap to a large limit; qdrant-client default is small (~100).
+            response = facet(
+                collection_name=COLLECTION_NAME,
+                key="doc_id",
+                limit=200_000,
+            )
+            hits = getattr(response, "hits", None) or []
+            seen: set[str] = set()
+            for hit in hits:
+                value = getattr(hit, "value", None) or getattr(hit, "key", None)
+                if not isinstance(value, str):
+                    continue
+                if any(value.startswith(pref) for pref in prefixes):
+                    seen.add(value)
+            logger.debug(
+                f"_facet_doc_ids: {len(hits)} distinct doc_ids in collection, "
+                f"{len(seen)} match prefixes {prefixes}"
+            )
+            return seen
+        except Exception as e:
+            logger.debug(f"facet API unavailable ({e}); falling back to scroll")
+            return None
+
+    def _scroll_doc_ids(self, prefixes: list[str]) -> set[str]:
+        """Fallback path: read every chunk's doc_id payload and dedupe in
+        Python. Cheap because the doc_id index lets Qdrant skip vectors."""
         seen: set[str] = set()
         next_offset = None
         page = 0
@@ -662,17 +724,22 @@ class WordPressSync:
                     seen.add(doc_id)
             if next_offset is None:
                 break
-        logger.debug(f"_list_doc_ids_with_prefixes: scrolled {page} page(s), found {len(seen)} matches")
+        logger.debug(f"_scroll_doc_ids: scrolled {page} page(s), found {len(seen)} matches")
         return seen
 
     # ----------------------- linked-PDF discovery -----------------------
 
     def _collect_pdf_links(self, html: str, host_url: str, host_doc_id: str) -> None:
-        """Find <a href> PDFs in the post body and add to the dedupe queue."""
+        """Parse HTML once and harvest PDF anchors. Thin wrapper for callers
+        that only have raw HTML (e.g. _discover_pdfs_in_route)."""
         try:
             soup = BeautifulSoup(html, "html.parser")
         except Exception:
             return
+        self._collect_pdf_links_from_soup(soup, host_url, host_doc_id)
+
+    def _collect_pdf_links_from_soup(self, soup, host_url: str, host_doc_id: str) -> None:
+        """Find <a href> PDFs in an already-parsed body and add to the dedupe queue."""
         for a in soup.find_all("a", href=True):
             href = (a.get("href") or "").strip()
             if not href or href.startswith(("#", "mailto:", "javascript:")):
@@ -777,16 +844,25 @@ class WordPressSync:
     ) -> None:
         """
         Drain the dedupe queue. For each unique PDF URL:
-          - If --dry-run: log it and continue.
+          - If --dry-run: log it and continue (don't touch failed-list state).
           - Else if doc_id exists and not full_resync: mark touched, skip download.
           - Else: download, extract, chunk, index under wp-linkedpdf-<hash>.
-        404/410 are treated as skip-permanent (file gone from server).
+        404/410 are treated as skip-permanent (file gone from server) - clear
+        them from the failed-PDF list.
+        Other failures are persisted in the failed-PDF list so the next run
+        retries them regardless of watermark.
         """
         if not self._linked_pdfs:
             logger.info("No linked PDFs discovered.")
+            if not dry_run:
+                # Nothing to do, but also nothing failed - leave state alone.
+                pass
             return
 
-        logger.info(f"Linked PDFs: {len(self._linked_pdfs)} unique URL(s) discovered")
+        logger.info(f"Linked PDFs: {len(self._linked_pdfs)} unique URL(s) to process")
+
+        # Track URLs that hit retryable failures this run; persist at end.
+        retry_next_run: set[str] = set(self.state.get_failed_pdfs())
 
         for url, info in sorted(self._linked_pdfs.items()):
             report.fetched += 1
@@ -804,6 +880,7 @@ class WordPressSync:
             if not full_resync and self._chunk_exists_for_doc(doc_id):
                 logger.info(f"  skip {doc_id} (already indexed): {url}")
                 report.skipped += 1
+                retry_next_run.discard(url)
                 continue
 
             try:
@@ -820,6 +897,7 @@ class WordPressSync:
                 )
                 report.indexed += 1
                 report.chunks += chunks_indexed
+                retry_next_run.discard(url)
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code if e.response is not None else 0
                 if status in (404, 410):
@@ -827,13 +905,29 @@ class WordPressSync:
                         f"Linked PDF gone (HTTP {status}): {url}"
                     )
                     report.skipped += 1
+                    retry_next_run.discard(url)  # never coming back, stop retrying
                 else:
                     logger.error(f"Linked PDF failed {url}: {describe_exception(e)}")
                     report.errors += 1
+                    retry_next_run.add(url)
             except Exception as e:
                 logger.error(f"Linked PDF failed {url}: {describe_exception(e)}")
                 logger.debug("Full traceback:", exc_info=True)
                 report.errors += 1
+                retry_next_run.add(url)
+
+        if not dry_run:
+            # Persist the new failed-PDF list, replacing the old one.
+            previous = self.state.get_failed_pdfs()
+            if retry_next_run != previous:
+                self.state.set_failed_pdfs(retry_next_run)
+                if retry_next_run:
+                    logger.info(
+                        f"Linked PDFs: {len(retry_next_run)} URL(s) will be retried "
+                        "on the next run (persisted to state file)"
+                    )
+                else:
+                    logger.info("Linked PDFs: failed-list cleared (all URLs succeeded or are gone)")
 
     @staticmethod
     def _derive_pdf_slug(url: str) -> str:
@@ -854,22 +948,72 @@ class WordPressSync:
         slug = doc_prefix.removeprefix("wp-")
         return slug.replace("-", " ").replace("_", " ").title() if slug else "Document"
 
-    @staticmethod
-    def _html_to_text(html: str) -> str:
+    @classmethod
+    def _html_to_text(cls, html: str) -> str:
+        """Parse HTML and convert to plain text with structural markers. Thin
+        wrapper around _soup_to_text for callers that only have raw HTML."""
         if not html:
             return ""
-        soup = BeautifulSoup(html, "html.parser")
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            return ""
+        return cls._soup_to_text(soup)
+
+    @staticmethod
+    def _soup_to_text(soup) -> str:
+        """
+        Convert a parsed BeautifulSoup body to plain text with structural
+        markers preserved as lightweight markdown:
+          - <h1>..<h6> become "# Heading" / "## Heading" / etc.
+          - <li>     becomes "- item"
+          - <br>     becomes a newline
+          - block-level elements get separated by blank lines
+
+        Markdown markers help two downstream consumers:
+          1. The semantic chunker - blank lines around headings/lists give it
+             clean boundaries.
+          2. The LLM at generation time - it sees that "## Foo" is a heading
+             and can use it as a structural anchor in the answer.
+        """
+        if soup is None:
+            return ""
+
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
         for c in soup.find_all(string=lambda s: isinstance(s, Comment)):
             c.extract()
-        # Convert <br> to newlines, paragraph-ish blocks get blank-line separators.
+
+        # Headings - prefix with the right number of #s.
+        for level in range(1, 7):
+            for h in soup.find_all(f"h{level}"):
+                hashes = "#" * level
+                inner = h.get_text(" ", strip=True)
+                # Replace the whole heading with a synthetic paragraph that
+                # carries the markdown prefix and trailing blank-line marker.
+                h.replace_with(BeautifulSoup(
+                    f"\n\n{hashes} {inner}\n\n", "html.parser"
+                ))
+
+        # List items - prefix with "- "
+        for li in soup.find_all("li"):
+            inner = li.get_text(" ", strip=True)
+            li.replace_with(BeautifulSoup(
+                f"\n- {inner}", "html.parser"
+            ))
+
+        # <br> -> newline
         for br in soup.find_all("br"):
             br.replace_with("\n")
-        for block in soup.find_all(["p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6"]):
+
+        # Other block-level elements get blank-line separators.
+        for block in soup.find_all(["p", "div", "blockquote"]):
             block.append("\n\n")
+
         text = unescape(soup.get_text())
+        # Collapse runs of horizontal whitespace, but preserve newlines.
         text = re.sub(r"[ \t]+", " ", text)
+        # Tidy excess blank lines.
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 

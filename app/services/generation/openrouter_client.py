@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from typing import Any
@@ -8,6 +9,10 @@ from json_repair import repair_json
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Retry config for transient LLM failures (5xx, network blips, rate limits).
+_MAX_RETRIES = 3
+_BACKOFF_BASE = 1.5  # seconds; doubled on each retry
 
 LANG_NAMES = {"en": "English", "ar": "Arabic", "ur": "Urdu"}
 
@@ -57,12 +62,25 @@ class OpenRouterClient:
             f"CONTEXT (cite chunk_ids verbatim):\n{context}"
         )
 
-        raw = await self._chat(
-            system=system,
-            user=user,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-        )
+        try:
+            raw = await self._chat(
+                system=system,
+                user=user,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+        except Exception as e:
+            # Caller (chat endpoint) wraps no error handling around generate_answer;
+            # rather than 500 the user-facing endpoint, degrade gracefully with a
+            # plain message. The actual error is logged for ops visibility.
+            logger.error(f"OpenRouter generate_answer failed after retries: {e!r}")
+            return {
+                "answer": (
+                    "The answer service is temporarily unavailable. "
+                    "Please try again in a moment."
+                ),
+                "citations": [],
+            }
 
         parsed = self._parse_json(raw)
         if not isinstance(parsed, dict) or "answer" not in parsed:
@@ -123,14 +141,46 @@ class OpenRouterClient:
             "X-Title": "HubeAli RAG",
         }
 
-        resp = await self._client.post(
-            f"{self.base_url}/chat/completions",
-            json=payload,
-            headers=headers,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        # Retry on transient failures: network errors, 429 rate limit, 5xx.
+        # 4xx other than 429 are non-retryable (bad request, auth).
+        last_exc: Exception | None = None
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                resp = await self._client.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+            except (httpx.TransportError, httpx.TimeoutException) as e:
+                last_exc = e
+                logger.warning(
+                    f"OpenRouter transport error (attempt {attempt}/{_MAX_RETRIES}): {e!r}"
+                )
+            else:
+                if resp.status_code == 429:
+                    retry_after = float(resp.headers.get("Retry-After", _BACKOFF_BASE))
+                    logger.warning(
+                        f"OpenRouter rate-limited (attempt {attempt}/{_MAX_RETRIES}); "
+                        f"sleeping {retry_after}s"
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+                if 500 <= resp.status_code < 600:
+                    logger.warning(
+                        f"OpenRouter {resp.status_code} (attempt {attempt}/{_MAX_RETRIES})"
+                    )
+                else:
+                    resp.raise_for_status()
+                    data = resp.json()
+                    return data["choices"][0]["message"]["content"]
+
+            if attempt < _MAX_RETRIES:
+                await asyncio.sleep(_BACKOFF_BASE * (2 ** (attempt - 1)))
+
+        # Exhausted retries.
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("OpenRouter call failed after retries (last response was 5xx)")
 
     @staticmethod
     def _format_context(chunks: list[dict]) -> str:

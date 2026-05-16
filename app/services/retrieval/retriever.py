@@ -27,16 +27,30 @@ class HybridRetriever:
         query: str,
         top_k: int = 20,
         language_filter: str | None = None,
+        content_type_filter: str | list[str] | None = None,
     ) -> list[dict]:
         query_emb = self.embedder.embed_query(query)
 
-        # Treat 'unknown' as "no filter" — otherwise the retriever silently
-        # returns zero results when the query language can't be pinned down.
-        query_filter = None
+        # Treat 'unknown'/empty as "no filter" - otherwise the retriever
+        # silently returns zero results when the query language can't be
+        # pinned down or when the UI passes a vacuous 'all' source filter.
+        must: list = []
         if language_filter and language_filter != "unknown":
-            query_filter = Filter(must=[
-                FieldCondition(key="language", match=MatchValue(value=language_filter))
-            ])
+            must.append(FieldCondition(
+                key="language", match=MatchValue(value=language_filter)
+            ))
+        if content_type_filter:
+            if isinstance(content_type_filter, str):
+                must.append(FieldCondition(
+                    key="content_type", match=MatchValue(value=content_type_filter)
+                ))
+            else:
+                # Multi-value filter via OR'd nested filter inside `must`.
+                must.append(Filter(should=[
+                    FieldCondition(key="content_type", match=MatchValue(value=v))
+                    for v in content_type_filter
+                ]))
+        query_filter = Filter(must=must) if must else None
 
         # Qdrant client is sync — run in a thread so we don't block the event loop.
         def _query():

@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -27,17 +28,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 logger = logging.getLogger("loader")
 
 
-async def upload_via_api(folder: Path, api_url: str, api_key: str) -> None:
+def upload_via_api(folder: Path, api_url: str, api_key: str) -> None:
+    """Sync uploads. Originally used httpx.AsyncClient, but we hit the same
+    anyio TLS bug on Windows that the WP client had to dodge. Sync httpx
+    sidesteps it entirely and the script doesn't need concurrency."""
     pdfs = sorted(folder.glob("*.pdf"))
     if not pdfs:
         logger.warning(f"No PDFs found in {folder}")
         return
 
-    async with httpx.AsyncClient(timeout=300.0) as client:
+    with httpx.Client(timeout=300.0) as client:
         for pdf in pdfs:
             logger.info(f"Uploading {pdf.name}...")
             with pdf.open("rb") as f:
-                resp = await client.post(
+                resp = client.post(
                     f"{api_url}/api/ingest/pdf",
                     headers={"X-API-Key": api_key},
                     files={"file": (pdf.name, f, "application/pdf")},
@@ -49,8 +53,8 @@ async def upload_via_api(folder: Path, api_url: str, api_key: str) -> None:
 
             # Poll status
             while True:
-                await asyncio.sleep(3)
-                s = await client.get(
+                time.sleep(3)
+                s = client.get(
                     f"{api_url}/api/ingest/status/{doc_id}",
                     headers={"X-API-Key": api_key},
                 )
@@ -115,7 +119,7 @@ def main() -> None:
     if args.offline:
         asyncio.run(load_offline(folder))
     else:
-        asyncio.run(upload_via_api(folder, args.api, args.api_key))
+        upload_via_api(folder, args.api, args.api_key)
 
 
 if __name__ == "__main__":

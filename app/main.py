@@ -84,9 +84,12 @@ def _maybe_start_wordpress_scheduler():
 
 app = FastAPI(title="HubeAli Multilingual RAG", lifespan=lifespan)
 
+_cors_origins = [
+    o.strip() for o in (settings.CORS_ALLOWED_ORIGINS or "").split(",") if o.strip()
+] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -22,6 +22,21 @@ class Settings(BaseSettings):
     # API auth
     API_KEY: str = "change-me-in-production"
 
+    # CORS - comma-separated list of allowed origins, or "*" for any (dev only).
+    # Tighten in production to your front-end origin(s).
+    CORS_ALLOWED_ORIGINS: str = "*"
+
+    # Chat rate limit (per-IP, sliding 60s window). 0 disables.
+    CHAT_RATE_LIMIT_PER_MINUTE: int = 20
+
+    # Public base URL of THIS backend, used by the front-end widget to call
+    # /chat. Leave empty to use same-origin relative URLs (works for the
+    # default deployment where the API and UI live at the same domain).
+    # Set e.g. "https://api.hubeali.com" if the chat widget is embedded on
+    # another domain and needs to call this API cross-origin. Should NOT end
+    # with a trailing slash (we trim defensively anyway).
+    PUBLIC_BACKEND_URL: str = ""
+
     # Local working dirs
     UPLOAD_DIR: str = "./tmp/rag_uploads"
 

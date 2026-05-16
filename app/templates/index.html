@@ -20,7 +20,7 @@
         <button class="ha-src-btn" onclick="setSource(this,'books')">Books</button>
     </div>
     <div id="ha-messages">
-        <!--  Messages will appear here --> 
+        <!--  Messages will appear here -->
      </div>
     <div id="ha-input-area">
         <textarea id="ha-input" placeholder="Ask a question..." onkeydown="handleKey(event)"></textarea>
@@ -29,6 +29,14 @@
         </button>
     </div>
 </div>
-<script src="/static/script.js"></script>
+{# Backend-injected config consumed by script.js. backendUrl is empty for
+   same-origin deployments and an absolute https URL for cross-origin embeds.
+   tojson handles all JS-string escaping safely. #}
+<script>
+    window.HA_CONFIG = {
+        backendUrl: {{ backend_url | tojson }}
+    };
+</script>
+<script src="{{ url_for('static', path='/script.js') }}"></script>
 </body>
-</html> 
+</html>
