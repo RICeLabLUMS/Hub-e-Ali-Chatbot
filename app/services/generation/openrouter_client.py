@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -106,7 +107,11 @@ class OpenRouterClient:
 
         parsed = self._parse_json(raw)
         if not isinstance(parsed, dict) or "answer" not in parsed:
-            logger.warning(f"OpenRouter returned malformed JSON: {raw[:200]}...")
+            logger.warning(
+                f"OpenRouter response could not be parsed as the expected JSON "
+                f"shape (no 'answer' field). First 300 chars: {raw[:300]!r}"
+            )
+            logger.debug(f"Full raw OpenRouter response:\n{raw}")
             return {
                 "answer": "I don't know based on the provided sources.",
                 "citations": [],
@@ -264,12 +269,98 @@ class OpenRouterClient:
             )
         return "\n\n---\n\n".join(blocks)
 
+    @classmethod
+    def _parse_json(cls, raw: str) -> Any:
+        """
+        Best-effort JSON parsing for LLM output. Models occasionally produce
+        malformed JSON even with response_format={"type":"json_object"} set,
+        especially:
+          * markdown code fences (```json ... ```)
+          * over-escaped quotes (\\" outside any string)
+          * wrapped as a JSON-encoded string-of-JSON
+        We chain several recovery attempts; only return None when all fail.
+        """
+        if not raw:
+            return None
+
+        # 1. Strip surrounding whitespace and markdown code fences.
+        cleaned = raw.strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        # 2. Direct parse.
+        parsed = cls._try_json(cleaned)
+        if parsed is not None:
+            return parsed
+
+        # 3. The whole payload sometimes arrives wrapped as a JSON-encoded
+        #    string of JSON: "\"{\\\"answer\\\":...}\"". Decode once and retry.
+        if cleaned.startswith('"') and cleaned.endswith('"'):
+            try:
+                unwrapped = json.loads(cleaned)
+                if isinstance(unwrapped, str):
+                    parsed = cls._try_json(unwrapped)
+                    if parsed is not None:
+                        return parsed
+            except Exception:
+                pass
+
+        # 4. Over-escaped quotes outside string context: \" where " was meant.
+        #    Replace and retry.
+        unescaped = cleaned.replace('\\"', '"').replace("\\'", "'")
+        parsed = cls._try_json(unescaped)
+        if parsed is not None:
+            return parsed
+
+        # 5. Last resort: regex-extract the answer + citation chunk_ids even
+        #    from broken JSON. Better to return a partial answer than nothing.
+        return cls._regex_extract_answer(cleaned)
+
     @staticmethod
-    def _parse_json(raw: str) -> Any:
+    def _try_json(s: str) -> Any:
+        """Try strict parse then json_repair. Returns parsed value or None."""
         try:
-            return json.loads(raw)
+            return json.loads(s)
         except json.JSONDecodeError:
             try:
-                return json.loads(repair_json(raw))
+                repaired = repair_json(s)
+                return json.loads(repaired)
             except Exception:
                 return None
+
+    @staticmethod
+    def _regex_extract_answer(raw: str) -> Any:
+        """
+        Pull out the answer + citation chunk_ids from a broken JSON-ish blob.
+        Used only when every json.loads / json_repair attempt has failed.
+        Returns None if we can't find an answer field at all.
+        """
+        # Match "answer": "<content>" tolerating escaped quotes inside.
+        match = re.search(
+            r'"answer"\s*:\s*"((?:\\.|[^"\\])*)"',
+            raw,
+            re.DOTALL,
+        )
+        if not match:
+            return None
+
+        # Unescape JSON-ish escapes the regex preserved verbatim.
+        answer = match.group(1)
+        answer = (
+            answer
+            .replace("\\\\", "\\")
+            .replace('\\"', '"')
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+        )
+
+        citations = []
+        for cm in re.finditer(r'"chunk_id"\s*:\s*"([^"]+)"', raw):
+            citations.append({"chunk_id": cm.group(1)})
+
+        logger.warning(
+            f"LLM returned malformed JSON; recovered answer + {len(citations)} "
+            "citation(s) via regex fallback. Consider checking model output quality."
+        )
+        return {"answer": answer, "citations": citations}

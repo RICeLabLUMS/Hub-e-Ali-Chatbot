@@ -44,8 +44,13 @@ class Settings(BaseSettings):
     EMBEDDING_DEVICE: str = "auto"
 
     # Retrieval tuning
-    RETRIEVAL_TOP_K: int = 20
-    RERANK_TOP_K: int = 5
+    # RETRIEVAL_TOP_K: dense+sparse hybrid candidates fetched from Qdrant.
+    # RERANK_TOP_K:    candidates the cross-encoder ranks AND the count that
+    #                  reaches the LLM as context. Wider = better recall but
+    #                  more reranker compute (negligible on GPU) and more
+    #                  tokens to the LLM (real cost).
+    RETRIEVAL_TOP_K: int = 40
+    RERANK_TOP_K: int = 8
     # bge-reranker-v2-m3 supports up to 8192 tokens. 512 (the previous default)
     # was too short: chunks of ~400-500 tokens + query of ~30-50 tokens hit the
     # cap and got truncated, degrading rerank quality. 1024 fits any chunk +

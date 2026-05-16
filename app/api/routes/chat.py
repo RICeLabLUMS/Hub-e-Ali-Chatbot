@@ -117,17 +117,40 @@ async def chat(req: ChatRequest, request: Request):
         content_type_filter=content_type_filter,
     )
 
-    # If filtered retrieval came back empty, fall back to language-agnostic
-    # search (keep the content_type filter - that's a user intent we respect).
-    if not hits and lang != "unknown":
-        hits = await retriever.retrieve(
+    # If the language-filtered pass returned too few candidates for the
+    # reranker to do meaningful work, augment with a language-agnostic pass
+    # and dedupe by chunk_id. This fixes mixed-language corpora where the
+    # same document's chunks end up tagged with different languages (Arabic
+    # verses + English commentary in the same article, etc).
+    # We keep the content_type filter on both passes - that's user intent.
+    min_useful = max(settings.RERANK_TOP_K * 2, 8)
+    if len(hits) < min_useful and lang != "unknown":
+        extra = await retriever.retrieve(
             standalone,
             top_k=settings.RETRIEVAL_TOP_K,
             language_filter=None,
             content_type_filter=content_type_filter,
         )
+        seen_ids = {h["chunk_id"] for h in hits if h.get("chunk_id")}
+        hits.extend(h for h in extra if h.get("chunk_id") and h["chunk_id"] not in seen_ids)
 
     reranked = get_reranker().rerank(standalone, hits, top_k=settings.RERANK_TOP_K)
+
+    # One-line view of what's about to be sent to the LLM. Lets you correlate
+    # "I don't know" answers with shallow/wrong reranked chunks.
+    if reranked:
+        top_summary = ", ".join(
+            f"{(c.get('title') or c.get('source') or '?')[:30]}"
+            f"[{c.get('content_type') or '?'}{':p' + str(c['page']) if c.get('page') else ''}]"
+            f"@{c.get('rerank_score', 0):.2f}"
+            for c in reranked[:5]
+        )
+    else:
+        top_summary = "<none>"
+    logger.info(
+        f"[chat] lang={lang} standalone={standalone[:80]!r} "
+        f"hits={len(hits)} reranked={len(reranked)} top: {top_summary}"
+    )
 
     result = await openrouter.generate_answer(question, reranked, lang)
     answer = result.get("answer", "I don't know based on the provided sources.")
