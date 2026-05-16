@@ -64,6 +64,16 @@ def main() -> None:
              "Overrides the state watermark for this run only.",
     )
     parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="After a successful run, delete chunks for wp-* doc_ids that "
+             "exist in Qdrant but were not visited this run (i.e. items deleted "
+             "from WordPress). Implies --full-resync. Skipped automatically if "
+             "the run had any errors. Only touches doc_id prefixes for the "
+             "content types being synced - local PDFs and unrelated content "
+             "are never affected.",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable DEBUG logging (includes httpx wire-level traces).",
@@ -80,6 +90,7 @@ def main() -> None:
             content_types=_parse_content_types(args.content_types),
             since=args.since,
             full_resync=args.full_resync,
+            prune=args.prune,
         )
     except KeyboardInterrupt:
         logger.warning("Interrupted.")

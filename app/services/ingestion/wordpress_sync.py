@@ -60,6 +60,7 @@ class ContentTypeReport:
 @dataclass
 class SyncReport:
     per_type: dict[str, ContentTypeReport] = field(default_factory=dict)
+    pruned: int = 0  # orphaned wp-* doc_ids removed by --prune
 
     def for_type(self, key: str) -> ContentTypeReport:
         return self.per_type.setdefault(key, ContentTypeReport())
@@ -77,6 +78,8 @@ class SyncReport:
                 f"  {key}: fetched={r.fetched} indexed={r.indexed} "
                 f"chunks={r.chunks} errors={r.errors}"
             )
+        if self.pruned:
+            rows.append(f"  pruned: {self.pruned} orphan doc_id(s) removed")
         return "WordPress sync report:\n" + "\n".join(rows)
 
 
@@ -114,6 +117,7 @@ class WordPressSync:
         content_types: Optional[list[str]] = None,
         since: Optional[str] = None,
         full_resync: bool = False,
+        prune: bool = False,
     ) -> SyncReport:
         """
         Run one sync pass.
@@ -122,6 +126,11 @@ class WordPressSync:
                        None means "everything configured".
         since: ISO-8601 GMT timestamp to override the state watermark for this run.
         full_resync: if True, ignore the state file entirely (re-ingest everything).
+        prune: if True, after a successful run delete any wp-* doc_ids that
+               exist in Qdrant but were not visited this run (i.e. items
+               deleted from WordPress since they were last ingested).
+               Implies full_resync - we can only safely identify orphans when
+               we've visited every current WP item.
         """
         report = SyncReport()
         wanted = self._resolve_content_types(content_types)
@@ -129,13 +138,30 @@ class WordPressSync:
             logger.warning("WordPress sync: no content types selected")
             return report
 
+        if prune and not full_resync:
+            logger.info("prune=True forces full_resync=True (orphan detection requires a complete pass)")
+            full_resync = True
+
         user_display = settings.WORDPRESS_USERNAME or "<none>"
         auth_display = "app-password" if settings.WORDPRESS_APP_PASSWORD else "anonymous"
         logger.info(
             f"WordPress sync starting: url={settings.WORDPRESS_URL} "
             f"user={user_display} auth={auth_display} "
-            f"content_types={wanted} full_resync={full_resync}"
+            f"content_types={wanted} full_resync={full_resync} prune={prune}"
         )
+
+        # Capture pre-existing wp-* doc_ids (scoped to the prefixes we're syncing)
+        # so we can identify orphans after the pass.
+        prefixes_in_scope: list[str] = [self._doc_prefix_for_key(k) for k in wanted]
+        existing_doc_ids: set[str] = set()
+        if prune:
+            existing_doc_ids = self._list_doc_ids_with_prefixes(prefixes_in_scope)
+            logger.info(
+                f"Prune: found {len(existing_doc_ids)} existing doc_id(s) in scope "
+                f"(prefixes={prefixes_in_scope})"
+            )
+
+        touched_doc_ids: set[str] = set()
 
         with self.client_factory() as wp:
             # Fail fast with a clean diagnostic if the site is unreachable / auth wrong.
@@ -153,7 +179,7 @@ class WordPressSync:
                 logger.info(f"WP sync [{key}] starting (modified_after={watermark!r})")
                 try:
                     if key == "media":
-                        self._sync_media(wp, watermark, report.for_type(key))
+                        self._sync_media(wp, watermark, report.for_type(key), touched_doc_ids)
                     else:
                         route, doc_prefix = self._route_for(key)
                         self._sync_text_route(
@@ -163,11 +189,30 @@ class WordPressSync:
                             state_key=key,
                             modified_after=watermark,
                             report=report.for_type(key),
+                            touched=touched_doc_ids,
                         )
                 except Exception as e:
                     logger.error(f"WP sync [{key}] failed: {describe_exception(e)}")
                     logger.debug("Full traceback:", exc_info=True)
                     report.for_type(key).errors += 1
+
+        if prune:
+            if report.total_errors:
+                logger.warning(
+                    f"Prune skipped: {report.total_errors} error(s) during sync — "
+                    "we won't risk deleting chunks for items we may have failed to visit. "
+                    "Resolve the errors and re-run."
+                )
+            else:
+                orphans = existing_doc_ids - touched_doc_ids
+                if orphans:
+                    logger.info(f"Prune: removing {len(orphans)} orphan doc_id(s): "
+                                f"{sorted(orphans)[:10]}{'...' if len(orphans) > 10 else ''}")
+                    for doc_id in sorted(orphans):
+                        self._delete_doc_chunks(doc_id)
+                    report.pruned = len(orphans)
+                else:
+                    logger.info("Prune: no orphans to remove")
 
         logger.info(report.summary())
         return report
@@ -182,11 +227,14 @@ class WordPressSync:
         state_key: str,
         modified_after: Optional[str],
         report: ContentTypeReport,
+        touched: set[str],
     ) -> None:
         for item in wp.list_content(route, modified_after=modified_after):
             report.fetched += 1
             item_id = item.get("id")
             modified_gmt = item.get("modified_gmt") or item.get("modified") or ""
+            if item_id is not None:
+                touched.add(f"{doc_prefix}-{item_id}")
             try:
                 chunks_indexed = self._process_text_item(item, doc_prefix)
                 report.indexed += 1
@@ -219,6 +267,9 @@ class WordPressSync:
             page_number=1,
             source=f"wp:{doc_prefix.removeprefix('wp-')}:{slug}",
             is_ocr=False,
+            title=title or slug,
+            url=item.get("link") or None,
+            content_type=self._display_content_type(doc_prefix),
         )
         page.language = detect_language(page.text)
 
@@ -243,12 +294,15 @@ class WordPressSync:
         wp: WordPressClient,
         modified_after: Optional[str],
         report: ContentTypeReport,
+        touched: set[str],
     ) -> None:
         for item in wp.list_media_pdfs(modified_after=modified_after):
             report.fetched += 1
             item_id = item.get("id")
             modified_gmt = item.get("modified_gmt") or item.get("modified") or ""
             source_url = item.get("source_url")
+            if item_id is not None:
+                touched.add(f"wp-media-{item_id}")
             if not source_url:
                 logger.warning(f"WP media id={item_id} has no source_url; skipping")
                 report.errors += 1
@@ -260,6 +314,9 @@ class WordPressSync:
                     item_id,
                     item.get("slug") or str(item_id),
                     pdf_bytes,
+                    title=self._html_to_text((item.get("title") or {}).get("rendered", ""))
+                          or (item.get("slug") or str(item_id)),
+                    url=source_url,
                 )
                 report.indexed += 1
                 report.chunks += chunks_indexed
@@ -270,7 +327,14 @@ class WordPressSync:
                 logger.debug("Full traceback:", exc_info=True)
                 report.errors += 1
 
-    def _process_pdf_bytes(self, item_id: int, slug: str, pdf_bytes: bytes) -> int:
+    def _process_pdf_bytes(
+        self,
+        item_id: int,
+        slug: str,
+        pdf_bytes: bytes,
+        title: str,
+        url: str,
+    ) -> int:
         upload_dir = settings.upload_dir_path
         with tempfile.NamedTemporaryFile(
             dir=str(upload_dir),
@@ -288,6 +352,9 @@ class WordPressSync:
                 # Source the PDF as wp:media:<slug> so it's visible in retrieval payloads
                 p.source = f"wp:media:{slug}"
                 p.language = detect_language(p.text)
+                p.title = title
+                p.url = url
+                p.content_type = "PDF"
 
             chunks = self.chunker.chunk_pages(pages, doc_id=doc_id)
             if not chunks:
@@ -351,6 +418,61 @@ class WordPressSync:
             slug = key.split(":", 1)[1]
             return f"wp/v2/{slug}", f"wp-{slug}"
         raise ValueError(f"Unknown content type key: {key}")
+
+    @staticmethod
+    def _doc_prefix_for_key(key: str) -> str:
+        """The doc_id prefix used for a given content-type key (e.g. 'wp-post-')."""
+        if key == "posts":
+            return "wp-post-"
+        if key == "pages":
+            return "wp-page-"
+        if key == "media":
+            return "wp-media-"
+        if key.startswith("cpt:"):
+            return f"wp-{key.split(':', 1)[1]}-"
+        raise ValueError(f"Unknown content type key: {key}")
+
+    def _list_doc_ids_with_prefixes(self, prefixes: list[str]) -> set[str]:
+        """
+        Return the set of distinct doc_ids in the collection whose value
+        starts with any of the given prefixes. Uses scroll because Qdrant's
+        keyword index doesn't support prefix match - we read each point's
+        doc_id and filter in Python. With the doc_id payload index this is
+        cheap (no vector deserialization).
+        """
+        seen: set[str] = set()
+        next_offset = None
+        page = 0
+        while True:
+            points, next_offset = self.qdrant.scroll(
+                collection_name=COLLECTION_NAME,
+                limit=1000,
+                with_payload=["doc_id"],
+                with_vectors=False,
+                offset=next_offset,
+            )
+            page += 1
+            for p in points:
+                doc_id = (p.payload or {}).get("doc_id")
+                if not doc_id:
+                    continue
+                if any(doc_id.startswith(pref) for pref in prefixes):
+                    seen.add(doc_id)
+            if next_offset is None:
+                break
+        logger.debug(f"_list_doc_ids_with_prefixes: scrolled {page} page(s), found {len(seen)} matches")
+        return seen
+
+    @staticmethod
+    def _display_content_type(doc_prefix: str) -> str:
+        """Human-readable label shown in the chat UI ("Article", "Page", ...)."""
+        if doc_prefix == "wp-post":
+            return "Article"
+        if doc_prefix == "wp-page":
+            return "Page"
+        # CPT: wp-<slug>  ->  Slug (title-cased, hyphens to spaces).
+        slug = doc_prefix.removeprefix("wp-")
+        return slug.replace("-", " ").replace("_", " ").title() if slug else "Document"
 
     @staticmethod
     def _html_to_text(html: str) -> str:

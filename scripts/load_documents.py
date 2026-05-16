@@ -90,8 +90,11 @@ async def load_offline(folder: Path) -> None:
         logger.info(f"Processing {pdf.name} as doc_id={doc_id}...")
 
         pages = extractor.extract(str(pdf))
+        # Display metadata: local files have no canonical URL, so url stays None.
         for p in pages:
             p.language = detect_language(p.text)
+            p.title = pdf.stem
+            p.content_type = "PDF"
 
         chunks = chunker.chunk_pages(pages, doc_id=doc_id)
         total = indexer.index_chunks(chunks, doc_id=doc_id)

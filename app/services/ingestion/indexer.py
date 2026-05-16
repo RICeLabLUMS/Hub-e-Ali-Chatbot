@@ -66,6 +66,9 @@ class QdrantIndexer:
                     "char_end": chunk.char_end,
                     "token_count": chunk.token_count,
                     "snippet": snippet,
+                    "title": chunk.title,
+                    "url": chunk.url,
+                    "content_type": chunk.content_type,
                 },
             ))
 

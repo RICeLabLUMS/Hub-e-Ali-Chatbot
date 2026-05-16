@@ -18,6 +18,11 @@ class ExtractedPage:
     width: Optional[float] = None
     height: Optional[float] = None
     language: str = "unknown"   # populated by the ingest pipeline after extraction
+    # Display metadata - propagated to chunks so the chat layer can render
+    # nice citations ("<title> - <content_type>, p. <page>" with a clickable url).
+    title: Optional[str] = None
+    url: Optional[str] = None
+    content_type: Optional[str] = None
 
 
 class PDFExtractor:

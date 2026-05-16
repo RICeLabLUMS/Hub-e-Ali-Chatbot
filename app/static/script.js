@@ -61,8 +61,8 @@ async function sendMsg() {
         respDiv.innerHTML = `
             <div class="ha-avatar">☽</div>
             <div>
-                <div class="ha-label">${data.source_label}</div>
-                <div class="ha-bubble">${data.answer}</div>
+                <div class="ha-bubble">${escapeHtml(data.answer)}</div>
+                ${renderCitations(data.citations)}
             </div>`;
         msgs.appendChild(respDiv);
         msgs.scrollTop = msgs.scrollHeight;
@@ -71,4 +71,29 @@ async function sendMsg() {
         typingDiv.remove();
         console.error("Error:", error);
     }
+}
+
+function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function renderCitations(citations) {
+    if (!citations || !citations.length) return '';
+    const items = citations.map(c => {
+        const title = escapeHtml(c.title || 'Source');
+        const type = c.content_type ? `<span class="ha-cite-type">${escapeHtml(c.content_type)}</span>` : '';
+        const page = (c.page != null && String(c.content_type).toUpperCase() === 'PDF')
+            ? `<span class="ha-cite-page">p.&nbsp;${escapeHtml(c.page)}</span>` : '';
+        const inner = `${title}${type ? ' &middot; ' + type : ''}${page ? ' &middot; ' + page : ''}`;
+        return c.url
+            ? `<a class="ha-cite" href="${escapeHtml(c.url)}" target="_blank" rel="noopener noreferrer">${inner}</a>`
+            : `<span class="ha-cite">${inner}</span>`;
+    }).join('');
+    return `<div class="ha-citations">${items}</div>`;
 }

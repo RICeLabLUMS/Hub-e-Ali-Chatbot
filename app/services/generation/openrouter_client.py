@@ -13,7 +13,7 @@ LANG_NAMES = {"en": "English", "ar": "Arabic", "ur": "Urdu"}
 
 ANSWER_SYSTEM_TEMPLATE = (
     "You answer questions about Islamic texts. Reply STRICTLY as JSON matching:\n"
-    '{{"answer": "<answer in {lang_name}>", "citations": [{{"chunk_id": "...", "source": "...", "page": <int>}}]}}\n\n'
+    '{{"answer": "<answer in {lang_name}>", "citations": [{{"chunk_id": "..."}}]}}\n\n'
     "Rules:\n"
     "- Use ONLY the provided context. Never invent facts.\n"
     "- If the context does not answer the question, return:\n"
@@ -136,9 +136,16 @@ class OpenRouterClient:
     def _format_context(chunks: list[dict]) -> str:
         blocks = []
         for c in chunks:
+            header_parts = [f"chunk_id={c.get('chunk_id')}"]
+            if c.get("title"):
+                header_parts.append(f"title={c['title']!r}")
+            if c.get("content_type"):
+                header_parts.append(f"type={c['content_type']}")
+            if c.get("page") is not None:
+                header_parts.append(f"page={c['page']}")
+            header_parts.append(f"source={c.get('source')}")
             blocks.append(
-                f"[chunk_id={c.get('chunk_id')} | source={c.get('source')} | page={c.get('page')}]\n"
-                f"{c.get('text', '')}"
+                f"[{' | '.join(header_parts)}]\n{c.get('text', '')}"
             )
         return "\n\n---\n\n".join(blocks)
 

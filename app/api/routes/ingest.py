@@ -78,8 +78,12 @@ async def _process_pdf(doc_id: str, payload: dict, status_cb: Callable[[dict], N
         logger.info(f"[{doc_id}] Extracted {len(pages)} pages from {filename}")
 
         # Tag each page with detected language (rough — chunker refines per segment)
+        # and display metadata used by the chat-side citation renderer.
+        title_from_filename = os.path.splitext(os.path.basename(filename))[0]
         for page in pages:
             page.language = detect_language(page.text)
+            page.title = title_from_filename
+            page.content_type = "PDF"
 
         status_cb({"message": "Chunking"})
         embedder = get_embedder()

@@ -65,21 +65,63 @@ async def chat(req: ChatRequest):
 
     result = await openrouter.generate_answer(question, reranked, lang)
     answer = result.get("answer", "I don't know based on the provided sources.")
-    citations = result.get("citations", [])
+    model_citations = result.get("citations", [])
 
     memory.store_memory(question, answer)
 
-    source_label = ""
-    if reranked:
-        top = reranked[0]
-        source_label = f"{top.get('source', 'Unknown')} — page {top.get('page', 'N/A')}"
+    # Enrich the model's chunk_id citations with display metadata from the
+    # reranked payloads. Anything the LLM cited but wasn't in context is dropped.
+    chunk_index = {c.get("chunk_id"): c for c in reranked if c.get("chunk_id")}
+    citations = []
+    for cit in model_citations:
+        chunk_id = cit.get("chunk_id")
+        ref = chunk_index.get(chunk_id)
+        if not ref:
+            continue
+        citations.append(_build_citation(ref))
+
+    # Fall back to the top reranked hit if the LLM produced no usable citations.
+    if not citations and reranked:
+        citations.append(_build_citation(reranked[0]))
+
+    top_label = citations[0]["label"] if citations else ""
+    top_url = citations[0]["url"] if citations else None
 
     return {
         "answer": answer,
         "language_detected": lang,
-        "source_label": source_label,
+        "source_label": top_label,
+        "source_url": top_url,
         "citations": citations,
         # Legacy fields preserved for any existing UI binding
-        "source_title": reranked[0].get("source") if reranked else "Unknown",
-        "page": reranked[0].get("page") if reranked else "N/A",
+        "source_title": citations[0]["title"] if citations else "Unknown",
+        "page": citations[0]["page"] if citations else "N/A",
+    }
+
+
+def _build_citation(chunk: dict) -> dict:
+    """Shape one chunk's payload into a display-ready citation dict."""
+    title = chunk.get("title") or chunk.get("source") or "Unknown"
+    content_type = chunk.get("content_type") or ""
+    page = chunk.get("page")
+    url = chunk.get("url")
+
+    parts = [title]
+    if content_type:
+        suffix = content_type
+        if content_type.upper() == "PDF" and page:
+            suffix = f"{content_type}, p. {page}"
+        parts.append(suffix)
+    elif page is not None:
+        parts.append(f"p. {page}")
+    label = " — ".join(parts)
+
+    return {
+        "chunk_id": chunk.get("chunk_id"),
+        "title": title,
+        "content_type": content_type,
+        "page": page,
+        "url": url,
+        "source": chunk.get("source"),
+        "label": label,
     }

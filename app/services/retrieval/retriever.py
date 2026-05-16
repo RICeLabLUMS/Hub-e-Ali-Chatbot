@@ -74,6 +74,9 @@ class HybridRetriever:
                 "lang": r.payload.get("language"),
                 "snippet": r.payload.get("snippet", ""),
                 "is_ocr": r.payload.get("is_ocr", False),
+                "title": r.payload.get("title"),
+                "url": r.payload.get("url"),
+                "content_type": r.payload.get("content_type"),
                 "score": r.score,
             }
             for r in results.points

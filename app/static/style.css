@@ -162,3 +162,33 @@
 }
 
 #ha-send svg { width: 16px; height: 16px; fill: #fff; }
+
+/* Citations under each answer */
+.ha-citations {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ha-cite {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 14px;
+  background: var(--ha-surface);
+  border: 0.5px solid var(--ha-border);
+  color: var(--ha-muted);
+  text-decoration: none;
+  line-height: 1.4;
+}
+a.ha-cite:hover { color: var(--ha-green); border-color: var(--ha-green); }
+.ha-cite-type {
+  font-size: 11px;
+  opacity: 0.8;
+}
+.ha-cite-page {
+  font-size: 11px;
+  opacity: 0.8;
+}

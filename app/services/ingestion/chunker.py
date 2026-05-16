@@ -23,6 +23,10 @@ class Chunk:
     char_start: int
     char_end: int
     token_count: Optional[int] = None
+    # Display metadata (copied from ExtractedPage on chunking).
+    title: Optional[str] = None
+    url: Optional[str] = None
+    content_type: Optional[str] = None
 
 
 class MultilingualChunker:
@@ -55,6 +59,12 @@ class MultilingualChunker:
         )
         self.min_chunk_chars = min_chunk_chars
 
+    # bge-m3 max context is 8192 tokens (~30k chars). Pre-split segments above
+    # this so chonkie's internal tokenization stays under the embedding model's
+    # window. 16000 chars is a safe upper bound (~4000 tokens) that still lets
+    # chonkie find good semantic boundaries inside each piece.
+    MAX_SEGMENT_CHARS = 16000
+
     def chunk_pages(self, pages: list, doc_id: str) -> list[Chunk]:
         all_chunks: list[Chunk] = []
         dropped = 0
@@ -69,37 +79,80 @@ class MultilingualChunker:
                 continue
 
             for seg_idx, (segment_text, seg_lang) in enumerate(segments):
-                try:
-                    raw_chunks = self.chunker.chunk(segment_text)
-                except Exception as e:
-                    logger.warning(
-                        f"Chunker failed on page {page.page_number} segment {seg_idx}: {e}; "
-                        f"falling back to whole segment"
-                    )
-                    raw_chunks = [_PseudoChunk(segment_text)]
+                for sub_idx, sub_segment in enumerate(
+                    self._split_long_segment(segment_text, self.MAX_SEGMENT_CHARS)
+                ):
+                    try:
+                        raw_chunks = self.chunker.chunk(sub_segment)
+                    except Exception as e:
+                        logger.warning(
+                            f"Chunker failed on page {page.page_number} segment {seg_idx}/{sub_idx}: {e}; "
+                            f"falling back to whole sub-segment"
+                        )
+                        raw_chunks = [_PseudoChunk(sub_segment)]
 
-                for i, raw in enumerate(raw_chunks):
-                    chunk_text = raw.text.strip()
-                    if len(chunk_text) < self.min_chunk_chars:
-                        dropped += 1
-                        continue
+                    for i, raw in enumerate(raw_chunks):
+                        chunk_text = raw.text.strip()
+                        if len(chunk_text) < self.min_chunk_chars:
+                            dropped += 1
+                            continue
 
-                    chunk = Chunk(
-                        text=chunk_text,
-                        chunk_id=f"{doc_id}__p{page.page_number}__s{seg_idx}__c{i}",
-                        source=page.source,
-                        page_number=page.page_number,
-                        language=seg_lang,
-                        is_ocr=page.is_ocr,
-                        char_start=getattr(raw, "start_index", 0),
-                        char_end=getattr(raw, "end_index", len(chunk_text)),
-                        token_count=getattr(raw, "token_count", None),
-                    )
-                    all_chunks.append(chunk)
+                        chunk = Chunk(
+                            text=chunk_text,
+                            chunk_id=f"{doc_id}__p{page.page_number}__s{seg_idx}_{sub_idx}__c{i}",
+                            source=page.source,
+                            page_number=page.page_number,
+                            language=seg_lang,
+                            is_ocr=page.is_ocr,
+                            char_start=getattr(raw, "start_index", 0),
+                            char_end=getattr(raw, "end_index", len(chunk_text)),
+                            token_count=getattr(raw, "token_count", None),
+                            title=getattr(page, "title", None),
+                            url=getattr(page, "url", None),
+                            content_type=getattr(page, "content_type", None),
+                        )
+                        all_chunks.append(chunk)
 
         if dropped:
             logger.debug(f"Dropped {dropped} chunks below {self.min_chunk_chars} chars")
         return all_chunks
+
+    @staticmethod
+    def _split_long_segment(text: str, max_chars: int) -> list[str]:
+        """
+        Greedily pack paragraphs into ~max_chars buckets. If a single paragraph
+        is itself larger than max_chars, fall back to character-window slicing
+        on that paragraph only - rare but possible with PDFs that lack
+        paragraph breaks.
+        """
+        if len(text) <= max_chars:
+            return [text]
+
+        paragraphs = re.split(r"\n\s*\n", text)
+        pieces: list[str] = []
+        buf: list[str] = []
+        buf_len = 0
+        for p in paragraphs:
+            p = p.strip()
+            if not p:
+                continue
+            # Single paragraph too big: window it.
+            if len(p) > max_chars:
+                if buf:
+                    pieces.append("\n\n".join(buf))
+                    buf, buf_len = [], 0
+                for i in range(0, len(p), max_chars):
+                    pieces.append(p[i : i + max_chars])
+                continue
+            if buf_len + len(p) + 2 > max_chars and buf:
+                pieces.append("\n\n".join(buf))
+                buf, buf_len = [p], len(p)
+            else:
+                buf.append(p)
+                buf_len += len(p) + 2
+        if buf:
+            pieces.append("\n\n".join(buf))
+        return pieces
 
     def _clean_text(self, text: str) -> str:
         text = re.sub(r"\n{3,}", "\n\n", text)
