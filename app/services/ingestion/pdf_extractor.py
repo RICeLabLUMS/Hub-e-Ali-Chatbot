@@ -186,10 +186,16 @@ class PDFExtractor:
         """
         Lazy-load Surya predictors and cache them on the instance.
 
-        Surya rewrote its API around v0.6 - the old surya.model.* paths were
-        removed. We use the new Predictor classes (DetectionPredictor /
-        RecognitionPredictor), which encapsulate model + processor and accept
-        an optional device argument.
+        Surya's API has shifted several times:
+          * <0.6:  load_model / load_processor module functions
+          * 0.6-0.16: DetectionPredictor() / RecognitionPredictor()
+          * >=0.17: RecognitionPredictor(FoundationPredictor()) - the foundation
+                    model was split out so it can be shared with LayoutPredictor.
+        We try the modern path first, fall back to direct construction.
+
+        Recognition predictor is called as rec_predictor([image], det_predictor=det)
+        in the current API - no `langs` argument; the recognition model is fully
+        multilingual and auto-detects script.
 
         Returns: (det_predictor, rec_predictor)
         Raises RuntimeError on any unrecoverable load failure (loud, not silent).
@@ -205,6 +211,15 @@ class PDFExtractor:
                 "Scanned pages cannot be processed. "
                 "Install/repair with: pip install surya-ocr"
             )
+
+        # Propagate our EMBEDDING_DEVICE setting to Surya. Surya doesn't accept
+        # a device kwarg on its predictors - it reads the TORCH_DEVICE env var
+        # at import / model-load time. Set it before importing surya modules.
+        import os as _os
+        from app.core.config import settings as _settings
+        if _settings.EMBEDDING_DEVICE and _settings.EMBEDDING_DEVICE.lower() != "auto":
+            _os.environ.setdefault("TORCH_DEVICE", _settings.EMBEDDING_DEVICE.lower())
+
         try:
             from surya.detection import DetectionPredictor
             from surya.recognition import RecognitionPredictor
@@ -220,22 +235,56 @@ class PDFExtractor:
                 "Install with: pip install surya-ocr"
             ) from e
 
+        # Surya >=0.17 split the foundation model out: RecognitionPredictor
+        # now requires a FoundationPredictor argument. Older versions (0.6-0.16)
+        # constructed it directly. Try the modern path first; fall back for
+        # older installs.
         try:
             det_predictor = DetectionPredictor()
-            rec_predictor = RecognitionPredictor()
+            try:
+                from surya.foundation import FoundationPredictor
+                foundation_predictor = FoundationPredictor()
+                rec_predictor = RecognitionPredictor(foundation_predictor)
+            except ImportError:
+                # Older surya without foundation split.
+                rec_predictor = RecognitionPredictor()
         except Exception as e:
             self._surya_load_failed = True
             logger.error(f"surya model load failed: {e}", exc_info=True)
             raise RuntimeError(f"Surya OCR model load failed: {e}") from e
 
-        self._surya_models = (det_predictor, rec_predictor)
+        # Layout predictor is optional - we fall back to bbox heuristics if it
+        # can't be loaded (older surya, or any other error). Layout uses its
+        # own FoundationPredictor checkpoint (different from recognition's).
+        layout_predictor = None
+        if _settings.OCR_USE_LAYOUT:
+            try:
+                from surya.layout import LayoutPredictor
+                try:
+                    from surya.foundation import FoundationPredictor
+                    from surya.settings import settings as surya_settings
+                    layout_foundation = FoundationPredictor(
+                        checkpoint=surya_settings.LAYOUT_MODEL_CHECKPOINT
+                    )
+                    layout_predictor = LayoutPredictor(layout_foundation)
+                except ImportError:
+                    # Older surya: LayoutPredictor constructor took no args.
+                    layout_predictor = LayoutPredictor()
+                logger.info("Surya LayoutPredictor loaded (semantic reading order enabled)")
+            except Exception as e:
+                logger.warning(
+                    f"Surya LayoutPredictor unavailable, falling back to bbox heuristics: {e}"
+                )
+                layout_predictor = None
+
+        self._surya_models = (det_predictor, rec_predictor, layout_predictor)
         return self._surya_models
 
     def _extract_with_surya(self, page: fitz.Page) -> str:
         # Raises RuntimeError if Surya cannot be loaded - we want the caller
         # (and ultimately the sync report) to mark this PDF as failed rather
         # than silently producing zero chunks.
-        det_predictor, rec_predictor = self._get_surya_models()
+        det_predictor, rec_predictor, layout_predictor = self._get_surya_models()
 
         try:
             import numpy as np
@@ -257,19 +306,38 @@ class PDFExtractor:
             else:
                 pil_img = Image.fromarray(img_array.squeeze())
 
-            # Surya >=0.6 API: rec_predictor is callable, takes images +
-            # langs (one list per image) + the det_predictor it should chain
-            # text-line detection through. Returns a list of OCRResult.
-            results = rec_predictor(
+            # Modern Surya API: rec_predictor(images, det_predictor=...). The
+            # langs argument was removed - the recognition model is fully
+            # multilingual and auto-detects script per text line.
+            rec_results = rec_predictor(
                 [pil_img],
-                [["en", "ar", "ur"]],
-                det_predictor,
+                det_predictor=det_predictor,
             )
+            text_lines = rec_results[0].text_lines
+            confidence = float(settings.OCR_CONFIDENCE_THRESHOLD or 0.6)
+
+            # If layout is available, use model-based region ordering. Falls
+            # back to the bbox heuristic on any failure.
+            if layout_predictor is not None:
+                try:
+                    layout_results = layout_predictor([pil_img])
+                    layout_regions = self._extract_layout_regions(layout_results[0])
+                    if layout_regions:
+                        return self._reconstruct_with_layout(
+                            text_lines,
+                            layout_regions,
+                            confidence_threshold=confidence,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Layout reconstruction failed on page {page.number + 1}, "
+                        f"falling back to bbox heuristics: {e}"
+                    )
 
             return self._reconstruct_reading_order(
-                results[0].text_lines,
+                text_lines,
                 page_width_px=pil_img.width,
-                confidence_threshold=float(settings.OCR_CONFIDENCE_THRESHOLD or 0.6),
+                confidence_threshold=confidence,
             )
 
         except Exception as e:
@@ -282,6 +350,96 @@ class PDFExtractor:
                 exc_info=True,
             )
             return ""
+
+    @staticmethod
+    def _extract_layout_regions(layout_result) -> list:
+        """
+        Pull (label, bbox) pairs from a Surya LayoutResult in reading order.
+        Different surya versions name the regions list differently; we try
+        the common attribute names and return [] on any mismatch (caller
+        falls back to heuristics).
+        """
+        for attr in ("bboxes", "boxes", "layout_boxes"):
+            regions = getattr(layout_result, attr, None)
+            if regions:
+                return regions
+        return []
+
+    @staticmethod
+    def _reconstruct_with_layout(
+        text_lines,
+        layout_regions,
+        confidence_threshold: float,
+    ) -> str:
+        """
+        Use Surya's layout regions as the authoritative reading order:
+          1. drop low-confidence text lines (noise)
+          2. for each layout region in reading order:
+               - skip Page-header / Page-footer (boilerplate, pollutes search)
+               - find text lines whose bbox center falls in this region
+               - sort top-to-bottom, join with spaces (collapses soft wraps)
+               - prefix Title / Section-header regions with markdown so the
+                 chunker treats them as semantic boundaries and the LLM sees
+                 the structure when generating answers
+          3. join regions with blank lines
+
+        Lines that don't fall in any region (margin notes, page numbers
+        Surya didn't classify) are dropped. The layout model is generally
+        better at deciding "this is body content" than our heuristics.
+        """
+        confident = [
+            tl for tl in text_lines
+            if (getattr(tl, "confidence", None) or 0) >= confidence_threshold
+            and (tl.text or "").strip()
+        ]
+        if not confident:
+            return ""
+
+        SKIP_LABELS = {"Page-header", "Page-footer", "page-header", "page-footer"}
+        HEADING_LABELS = {
+            "Title", "Section-header", "Section-Header",
+            "title", "section-header",
+        }
+
+        output_parts: list[str] = []
+        used_line_ids: set[int] = set()
+
+        for region in layout_regions:
+            label = getattr(region, "label", "") or ""
+            if label in SKIP_LABELS:
+                continue
+            bbox = getattr(region, "bbox", None)
+            if not bbox or len(bbox) < 4:
+                continue
+            rx0, ry0, rx1, ry1 = bbox[:4]
+
+            in_region = []
+            for tl in confident:
+                if id(tl) in used_line_ids:
+                    continue
+                lx0, ly0, lx1, ly1 = tl.bbox[:4]
+                cx = (lx0 + lx1) / 2
+                cy = (ly0 + ly1) / 2
+                if rx0 <= cx <= rx1 and ry0 <= cy <= ry1:
+                    in_region.append(tl)
+                    used_line_ids.add(id(tl))
+
+            if not in_region:
+                continue
+
+            in_region.sort(key=lambda tl: tl.bbox[1])
+            joined = " ".join(
+                tl.text.strip() for tl in in_region if tl.text and tl.text.strip()
+            )
+            if not joined:
+                continue
+
+            if label in HEADING_LABELS:
+                output_parts.append(f"## {joined}")
+            else:
+                output_parts.append(joined)
+
+        return "\n\n".join(output_parts)
 
     @staticmethod
     def _reconstruct_reading_order(

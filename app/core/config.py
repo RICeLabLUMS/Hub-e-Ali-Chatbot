@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     # Minimum confidence to keep an OCR'd line. Lower = more text (incl. noise);
     # higher = cleaner text but may drop borderline-legible lines.
     OCR_CONFIDENCE_THRESHOLD: float = 0.6
+    # Use Surya's LayoutPredictor for model-based reading-order reconstruction.
+    # Gives semantic region labels (Title / Text / List / Footnote / etc.) and
+    # proper reading order across columns. Costs ~one extra model load and ~2x
+    # OCR wall-time per scanned page. Falls back to bbox heuristics if layout
+    # can't be loaded.
+    OCR_USE_LAYOUT: bool = True
 
     # WordPress sync
     WORDPRESS_URL: str = ""
