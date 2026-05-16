@@ -726,13 +726,31 @@ class WordPressSync:
         digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
         return f"wp-linkedpdf-{digest}"
 
-    def _derive_pdf_title(self, url: str, anchor_text: Optional[str]) -> str:
+    # Anchor texts that look like CTAs rather than titles - we'd rather fall
+    # through to the filename stem than store these as the document title.
+    _GENERIC_ANCHOR_TEXTS = frozenset({
+        "download", "download pdf", "download here", "click here", "click",
+        "here", "view", "view pdf", "read", "read more", "read here",
+        "pdf", "link", "more", "open", "get pdf", "get it", "see",
+    })
+
+    @classmethod
+    def _derive_pdf_title(cls, url: str, anchor_text: Optional[str]) -> str:
         """Prefer anchor text if meaningful; else derive from the filename stem."""
-        if anchor_text and len(anchor_text) >= 3 and not anchor_text.lower().endswith(".pdf"):
-            return anchor_text
+        if anchor_text:
+            text = anchor_text.strip()
+            normalized = text.lower()
+            if (
+                len(text) >= 5
+                and normalized not in cls._GENERIC_ANCHOR_TEXTS
+                and not normalized.endswith(".pdf")
+                and not normalized.startswith(("http://", "https://"))
+            ):
+                return text
         filename = Path(urlsplit(url).path).name
-        stem = Path(filename).stem if filename else "document"
-        return stem.replace("-", " ").replace("_", " ")
+        stem = Path(filename).stem if filename else ""
+        title = stem.replace("-", " ").replace("_", " ").strip()
+        return title or "Document"
 
     def _chunk_exists_for_doc(self, doc_id: str) -> bool:
         """Cheap existence check via the doc_id payload index."""

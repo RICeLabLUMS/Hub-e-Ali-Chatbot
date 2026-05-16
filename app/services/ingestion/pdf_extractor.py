@@ -183,12 +183,22 @@ class PDFExtractor:
         return [p for p in pages if p.text.strip()]
 
     def _get_surya_models(self):
+        """
+        Lazy-load Surya predictors and cache them on the instance.
+
+        Surya rewrote its API around v0.6 - the old surya.model.* paths were
+        removed. We use the new Predictor classes (DetectionPredictor /
+        RecognitionPredictor), which encapsulate model + processor and accept
+        an optional device argument.
+
+        Returns: (det_predictor, rec_predictor)
+        Raises RuntimeError on any unrecoverable load failure (loud, not silent).
+        """
         # Already loaded - reuse.
         if self._surya_models is not None and self._surya_models is not False:
             return self._surya_models
         # Latched failure - don't keep retrying noisy imports per page, but
-        # also don't silently produce empty pages. Raise loud so the caller
-        # (and ultimately the sync report) records this PDF as failed.
+        # also don't silently produce empty pages.
         if self._surya_load_failed:
             raise RuntimeError(
                 "Surya OCR is unavailable (load previously failed). "
@@ -196,43 +206,41 @@ class PDFExtractor:
                 "Install/repair with: pip install surya-ocr"
             )
         try:
-            from surya.model.detection.model import load_model as load_det_model
-            from surya.model.detection.processor import load_processor as load_det_processor
-            from surya.model.recognition.model import load_model as load_rec_model
-            from surya.model.recognition.processor import load_processor as load_rec_processor
+            from surya.detection import DetectionPredictor
+            from surya.recognition import RecognitionPredictor
         except ImportError as e:
             self._surya_load_failed = True
-            logger.error("surya-ocr not installed. Install with: pip install surya-ocr")
+            logger.error(
+                "Surya OCR import failed. Either surya-ocr is not installed "
+                "(pip install surya-ocr) or its API has changed again. "
+                f"Underlying error: {e}"
+            )
             raise RuntimeError(
-                "surya-ocr is not installed. Install with: pip install surya-ocr"
+                "Surya OCR import failed. See logs for details. "
+                "Install with: pip install surya-ocr"
             ) from e
 
         try:
-            det_model = load_det_model()
-            det_processor = load_det_processor()
-            rec_model = load_rec_model()
-            rec_processor = load_rec_processor()
+            det_predictor = DetectionPredictor()
+            rec_predictor = RecognitionPredictor()
         except Exception as e:
             self._surya_load_failed = True
             logger.error(f"surya model load failed: {e}", exc_info=True)
             raise RuntimeError(f"Surya OCR model load failed: {e}") from e
 
-        self._surya_models = (det_model, det_processor, rec_model, rec_processor)
+        self._surya_models = (det_predictor, rec_predictor)
         return self._surya_models
 
     def _extract_with_surya(self, page: fitz.Page) -> str:
         # Raises RuntimeError if Surya cannot be loaded - we want the caller
         # (and ultimately the sync report) to mark this PDF as failed rather
         # than silently producing zero chunks.
-        models = self._get_surya_models()
+        det_predictor, rec_predictor = self._get_surya_models()
 
         try:
             import numpy as np
             from PIL import Image
-            from surya.ocr import run_ocr
             from app.core.config import settings
-
-            det_model, det_processor, rec_model, rec_processor = models
 
             # Render at configured scale (default 3x). PyMuPDF returns RGB(A)
             # pixels; surya is happy with grayscale, which also helps the
@@ -249,13 +257,13 @@ class PDFExtractor:
             else:
                 pil_img = Image.fromarray(img_array.squeeze())
 
-            results = run_ocr(
+            # Surya >=0.6 API: rec_predictor is callable, takes images +
+            # langs (one list per image) + the det_predictor it should chain
+            # text-line detection through. Returns a list of OCRResult.
+            results = rec_predictor(
                 [pil_img],
                 [["en", "ar", "ur"]],
-                det_model,
-                det_processor,
-                rec_model,
-                rec_processor,
+                det_predictor,
             )
 
             return self._reconstruct_reading_order(
