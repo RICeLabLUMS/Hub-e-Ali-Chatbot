@@ -37,6 +37,15 @@ class MultilingualChunker:
     semantic chunking, so each chunk has a single, accurate language tag.
     """
 
+    # bge-m3's max sequence length is 8192 tokens. We pre-split above this so
+    # chonkie's internal tokenization never trips the "10240 > 8192" warning
+    # from the underlying HF tokenizer. 4000 tokens leaves plenty of headroom
+    # for semantic boundary detection inside each piece.
+    MAX_TOKENS_PER_SEGMENT = 4000
+    # Fallback char window when no tokenizer is available - intentionally
+    # conservative for non-Latin scripts (Arabic/Urdu pack ~1.6 chars/token).
+    CHAR_FALLBACK_PER_SEGMENT = 6000
+
     def __init__(
         self,
         embedding_model: SentenceTransformer,
@@ -49,8 +58,18 @@ class MultilingualChunker:
         # don't pay the bge-m3 download/load twice.
         if isinstance(embedding_model, SentenceTransformer):
             wrapped = SentenceTransformerEmbeddings(model=embedding_model)
+            self._tokenizer = getattr(embedding_model, "tokenizer", None)
         else:
             wrapped = embedding_model
+            self._tokenizer = None
+
+        # Pre-set the once-only "sequence too long" warning flag so our own
+        # token-counting calls don't trip it. chonkie's later calls also stay
+        # quiet because every sub-segment we pass in fits under model_max_length.
+        if self._tokenizer is not None and hasattr(self._tokenizer, "deprecation_warnings"):
+            self._tokenizer.deprecation_warnings[
+                "sequence-length-is-longer-than-the-specified-maximum"
+            ] = True
 
         self.chunker = SemanticChunker(
             embedding_model=wrapped,
@@ -58,12 +77,6 @@ class MultilingualChunker:
             threshold=threshold,
         )
         self.min_chunk_chars = min_chunk_chars
-
-    # bge-m3 max context is 8192 tokens (~30k chars). Pre-split segments above
-    # this so chonkie's internal tokenization stays under the embedding model's
-    # window. 16000 chars is a safe upper bound (~4000 tokens) that still lets
-    # chonkie find good semantic boundaries inside each piece.
-    MAX_SEGMENT_CHARS = 16000
 
     def chunk_pages(self, pages: list, doc_id: str) -> list[Chunk]:
         all_chunks: list[Chunk] = []
@@ -80,7 +93,7 @@ class MultilingualChunker:
 
             for seg_idx, (segment_text, seg_lang) in enumerate(segments):
                 for sub_idx, sub_segment in enumerate(
-                    self._split_long_segment(segment_text, self.MAX_SEGMENT_CHARS)
+                    self._split_long_segment(segment_text)
                 ):
                     try:
                         raw_chunks = self.chunker.chunk(sub_segment)
@@ -117,17 +130,61 @@ class MultilingualChunker:
             logger.debug(f"Dropped {dropped} chunks below {self.min_chunk_chars} chars")
         return all_chunks
 
-    @staticmethod
-    def _split_long_segment(text: str, max_chars: int) -> list[str]:
+    def _split_long_segment(self, text: str) -> list[str]:
         """
-        Greedily pack paragraphs into ~max_chars buckets. If a single paragraph
-        is itself larger than max_chars, fall back to character-window slicing
-        on that paragraph only - rare but possible with PDFs that lack
-        paragraph breaks.
+        Split text into pieces each within the model's token budget. When the
+        tokenizer is available we count tokens precisely (necessary because
+        Arabic/Urdu pack many more tokens per character than English). Falls
+        back to a conservative character window if no tokenizer.
         """
-        if len(text) <= max_chars:
+        if self._tokenizer is None:
+            return self._split_by_chars(text, self.CHAR_FALLBACK_PER_SEGMENT)
+        return self._split_by_tokens(text, self.MAX_TOKENS_PER_SEGMENT)
+
+    def _split_by_tokens(self, text: str, max_tokens: int) -> list[str]:
+        # Quick token count - if under budget, nothing to split.
+        total_ids = self._tokenizer.encode(text, add_special_tokens=False, truncation=False)
+        if len(total_ids) <= max_tokens:
             return [text]
 
+        paragraphs = re.split(r"\n\s*\n", text)
+        pieces: list[str] = []
+        buf: list[str] = []
+        buf_tokens = 0
+
+        for p in paragraphs:
+            p = p.strip()
+            if not p:
+                continue
+            p_ids = self._tokenizer.encode(p, add_special_tokens=False, truncation=False)
+            p_tokens = len(p_ids)
+
+            # Single paragraph too big: slice its token IDs into windows.
+            if p_tokens > max_tokens:
+                if buf:
+                    pieces.append("\n\n".join(buf))
+                    buf, buf_tokens = [], 0
+                for i in range(0, p_tokens, max_tokens):
+                    sub_ids = p_ids[i : i + max_tokens]
+                    pieces.append(self._tokenizer.decode(sub_ids, skip_special_tokens=True))
+                continue
+
+            if buf_tokens + p_tokens > max_tokens and buf:
+                pieces.append("\n\n".join(buf))
+                buf, buf_tokens = [p], p_tokens
+            else:
+                buf.append(p)
+                buf_tokens += p_tokens
+
+        if buf:
+            pieces.append("\n\n".join(buf))
+        return pieces
+
+    @staticmethod
+    def _split_by_chars(text: str, max_chars: int) -> list[str]:
+        """Fallback char-based splitter when no tokenizer is available."""
+        if len(text) <= max_chars:
+            return [text]
         paragraphs = re.split(r"\n\s*\n", text)
         pieces: list[str] = []
         buf: list[str] = []
@@ -136,7 +193,6 @@ class MultilingualChunker:
             p = p.strip()
             if not p:
                 continue
-            # Single paragraph too big: window it.
             if len(p) > max_chars:
                 if buf:
                     pieces.append("\n\n".join(buf))
