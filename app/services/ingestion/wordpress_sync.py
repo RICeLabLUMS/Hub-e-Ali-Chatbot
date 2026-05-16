@@ -29,6 +29,7 @@ from html import unescape
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from bs4 import BeautifulSoup, Comment
 from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
 
@@ -54,6 +55,7 @@ class ContentTypeReport:
     fetched: int = 0
     indexed: int = 0  # number of source items successfully indexed
     chunks: int = 0   # total chunks upserted
+    skipped: int = 0  # items intentionally skipped (e.g. 404 media files missing on disk)
     errors: int = 0
 
 
@@ -76,7 +78,7 @@ class SyncReport:
         for key, r in sorted(self.per_type.items()):
             rows.append(
                 f"  {key}: fetched={r.fetched} indexed={r.indexed} "
-                f"chunks={r.chunks} errors={r.errors}"
+                f"chunks={r.chunks} skipped={r.skipped} errors={r.errors}"
             )
         if self.pruned:
             rows.append(f"  pruned: {self.pruned} orphan doc_id(s) removed")
@@ -344,6 +346,25 @@ class WordPressSync:
                 report.chunks += chunks_indexed
                 if not had_failure and modified_gmt:
                     safe_watermark = modified_gmt
+            except httpx.HTTPStatusError as e:
+                # 404/410 on the file itself = WP DB row exists but the file is
+                # gone from /wp-content/uploads. Common with old test uploads.
+                # Treat as skip-permanent: we can never index it, retrying won't
+                # help, and we don't want this to block the watermark or prune.
+                status = e.response.status_code if e.response is not None else 0
+                if status in (404, 410):
+                    logger.warning(
+                        f"WP media id={item_id}: source file missing on server "
+                        f"(HTTP {status}, url={source_url}). Skipping permanently."
+                    )
+                    report.skipped += 1
+                    if not had_failure and modified_gmt:
+                        safe_watermark = modified_gmt
+                else:
+                    logger.error(f"WP media id={item_id} failed: {describe_exception(e)}")
+                    logger.debug("Full traceback:", exc_info=True)
+                    report.errors += 1
+                    had_failure = True
             except Exception as e:
                 logger.error(f"WP media id={item_id} failed: {describe_exception(e)}")
                 logger.debug("Full traceback:", exc_info=True)
