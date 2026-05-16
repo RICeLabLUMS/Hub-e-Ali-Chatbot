@@ -31,6 +31,20 @@ class Settings(BaseSettings):
     # Retrieval tuning
     RETRIEVAL_TOP_K: int = 20
     RERANK_TOP_K: int = 5
+    # bge-reranker-v2-m3 supports up to 8192 tokens. 512 (the previous default)
+    # was too short: chunks of ~400-500 tokens + query of ~30-50 tokens hit the
+    # cap and got truncated, degrading rerank quality. 1024 fits any chunk +
+    # query comfortably with headroom.
+    RERANKER_MAX_LENGTH: int = 1024
+
+    # OCR tuning (Surya, applied to scanned PDF pages only)
+    # Render multiplier passed to PyMuPDF before OCR. Higher = sharper input
+    # for the recognizer but more memory + compute. 3 is the sweet spot for
+    # printed Arabic/Urdu; bump to 4 on very low-DPI source scans.
+    OCR_RENDER_SCALE: float = 3.0
+    # Minimum confidence to keep an OCR'd line. Lower = more text (incl. noise);
+    # higher = cleaner text but may drop borderline-legible lines.
+    OCR_CONFIDENCE_THRESHOLD: float = 0.6
 
     # WordPress sync
     WORDPRESS_URL: str = ""

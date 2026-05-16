@@ -14,8 +14,9 @@ class BGEReranker:
 
     def __init__(self) -> None:
         device = self._resolve_device(settings.EMBEDDING_DEVICE)
-        logger.info(f"Loading bge-reranker-v2-m3 on {device}...")
-        self.model = CrossEncoder(self.MODEL, device=device, max_length=512)
+        max_length = int(settings.RERANKER_MAX_LENGTH or 1024)
+        logger.info(f"Loading bge-reranker-v2-m3 on {device} (max_length={max_length})...")
+        self.model = CrossEncoder(self.MODEL, device=device, max_length=max_length)
 
     def rerank(self, query: str, chunks: list[dict], top_k: int | None = None) -> list[dict]:
         if not chunks:

@@ -84,6 +84,16 @@ class WordPressClient:
             follow_redirects=True,
             verify=verify_ssl,
         )
+        # Separate auth-free client for downloading from non-WP hosts (e.g.,
+        # CDNs in WORDPRESS_LINKED_PDF_HOSTS). Sending WP Basic Auth headers
+        # to an external host would leak credentials.
+        self._external_client = httpx.Client(
+            timeout=timeout,
+            headers=headers,
+            follow_redirects=True,
+            verify=verify_ssl,
+        )
+        self._wp_host = (urlsplit(self.base_url).hostname or "").lower()
         self._log_dns()
 
     def _log_dns(self) -> None:
@@ -108,6 +118,7 @@ class WordPressClient:
 
     def close(self) -> None:
         self._client.close()
+        self._external_client.close()
 
     def __enter__(self) -> "WordPressClient":
         return self
@@ -245,8 +256,16 @@ class WordPressClient:
                 yield item
 
     def download_media(self, source_url: str) -> bytes:
-        """Download a media file by its absolute source_url."""
-        resp = self._get_with_retry(source_url, params=None, absolute=True)
+        """
+        Download a media file by absolute URL. Routes through the WP-auth
+        client only if the URL is on the same host as base_url; otherwise
+        uses the auth-free external client so WP credentials never leak to
+        third-party hosts.
+        """
+        target_host = (urlsplit(source_url).hostname or "").lower()
+        use_auth = bool(self._wp_host) and target_host == self._wp_host
+        client = self._client if use_auth else self._external_client
+        resp = self._get_with_retry(source_url, params=None, absolute=True, client=client)
         resp.raise_for_status()
         return resp.content
 
@@ -264,12 +283,14 @@ class WordPressClient:
         url: str,
         params: Optional[dict],
         absolute: bool = False,
+        client: Optional[httpx.Client] = None,
     ) -> httpx.Response:
+        c = client if client is not None else self._client
         last_exc: Optional[Exception] = None
         resp: Optional[httpx.Response] = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                resp = self._client.get(url, params=params)
+                resp = c.get(url, params=params)
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 last_exc = e
                 resp = None

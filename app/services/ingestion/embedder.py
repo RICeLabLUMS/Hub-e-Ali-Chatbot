@@ -49,9 +49,12 @@ class BGEEmbedder:
         ]
 
     def embed_query(self, query: str) -> EmbeddingResult:
-        instructed = f"Represent this sentence for searching relevant passages: {query}"
+        # bge-m3 (unlike bge-large-en-v1.5) is trained WITHOUT an instruction
+        # prefix on either side. Adding one here would put the query into a
+        # different vector subspace than the documents (which are embedded raw
+        # in embed_texts) and silently degrade retrieval quality.
         dense_vec = self.dense_model.encode(
-            [instructed],
+            [query],
             normalize_embeddings=True,
             show_progress_bar=False,
         )[0]

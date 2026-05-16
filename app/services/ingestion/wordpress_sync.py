@@ -200,16 +200,41 @@ class WordPressSync:
             and bool(text_types_in_scope)
         )
 
-        # Capture pre-existing doc_ids in scope so we can identify orphans after
-        # the pass. In PDF-focused modes the scope is just wp-linkedpdf-, because
-        # text content isn't visited for indexing in those modes (so its doc_ids
-        # would never end up in `touched` and would all be flagged as orphans).
+        # Determine prune scope. Linked PDFs are safe to include only when this
+        # run visits EVERY configured text content type - otherwise we'd flag
+        # PDFs referenced from unvisited types as orphans and wrongly delete
+        # them. Same hazard with --content-types filtering on a regular run:
+        # restricting to e.g. "posts" means we never see PDFs that pages link
+        # to. We log a warning when --prune is in play with an incomplete scope.
+        configured_text_keys = {k for k in self._resolve_content_types(None) if k != "media"}
+        visited_text_keys = {k for k in wanted if k != "media"}
+        all_text_visited = bool(configured_text_keys) and configured_text_keys <= visited_text_keys
+
         if text_discovery_only:
-            prefixes_in_scope: list[str] = ["wp-linkedpdf-"]
+            # In PDF-focused modes the only safe prefix is wp-linkedpdf-, since
+            # text content isn't re-indexed (so its doc_ids would never end up
+            # in `touched` and would all be flagged as orphans).
+            prefixes_in_scope: list[str] = ["wp-linkedpdf-"] if all_text_visited else []
+            if prune and not all_text_visited:
+                logger.warning(
+                    f"Prune skipped: --content-types {sorted(visited_text_keys)} "
+                    f"doesn't cover all configured text types {sorted(configured_text_keys)}; "
+                    "cannot safely identify orphan linked PDFs."
+                )
         else:
             prefixes_in_scope = [self._doc_prefix_for_key(k) for k in wanted]
             if do_linked_pdfs:
-                prefixes_in_scope.append("wp-linkedpdf-")
+                if all_text_visited:
+                    prefixes_in_scope.append("wp-linkedpdf-")
+                elif prune:
+                    logger.warning(
+                        f"Prune scope excludes wp-linkedpdf-: --content-types "
+                        f"{sorted(visited_text_keys)} is a subset of configured text "
+                        f"types {sorted(configured_text_keys)}. Linked PDFs referenced "
+                        "only from unvisited types would be incorrectly flagged as "
+                        "orphans. Run without --content-types (or include all text "
+                        "types) to prune linked PDFs."
+                    )
         existing_doc_ids: set[str] = set()
         if prune:
             existing_doc_ids = self._list_doc_ids_with_prefixes(prefixes_in_scope)
