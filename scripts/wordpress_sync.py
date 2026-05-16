@@ -74,6 +74,14 @@ def main() -> None:
              "are never affected.",
     )
     parser.add_argument(
+        "--list-linked-pdfs",
+        action="store_true",
+        help="Audit mode: discover all PDF links referenced in any current WP "
+             "post/page/CPT, dedupe across the site, and print the list. "
+             "No downloads, no indexing, no writes to state. Use this to verify "
+             "the inventory before running a real sync.",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable DEBUG logging (includes httpx wire-level traces).",
@@ -91,6 +99,7 @@ def main() -> None:
             since=args.since,
             full_resync=args.full_resync,
             prune=args.prune,
+            list_linked_pdfs_only=args.list_linked_pdfs,
         )
     except KeyboardInterrupt:
         logger.warning("Interrupted.")

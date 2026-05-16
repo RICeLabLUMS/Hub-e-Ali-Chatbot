@@ -20,6 +20,7 @@ The orchestrator is synchronous. From an asyncio context (e.g. APScheduler
 hook in app/main.py), invoke it via asyncio.to_thread(sync.sync, ...).
 """
 
+import hashlib
 import logging
 import re
 import tempfile
@@ -28,6 +29,7 @@ from dataclasses import dataclass, field
 from html import unescape
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup, Comment
@@ -112,6 +114,24 @@ class WordPressSync:
         self.chunker = MultilingualChunker(embedding_model=self.embedder.dense_model)
         self.indexer = QdrantIndexer(client=self.qdrant, embedder=self.embedder)
 
+        # Linked-PDF discovery state (populated during text-content processing,
+        # drained after the main loop in sync()).
+        self._linked_pdfs: dict[str, dict] = {}
+        self._allowed_pdf_hosts = self._compute_allowed_hosts()
+
+    @staticmethod
+    def _compute_allowed_hosts() -> set[str]:
+        """Hosts allowed for linked-PDF downloads: WP host + any extras from settings."""
+        hosts: set[str] = set()
+        wp_host = urlsplit(settings.WORDPRESS_URL).hostname
+        if wp_host:
+            hosts.add(wp_host.lower())
+        for h in (settings.WORDPRESS_LINKED_PDF_HOSTS or "").split(","):
+            h = h.strip().lower()
+            if h:
+                hosts.add(h)
+        return hosts
+
     # ----------------------- public API -----------------------
 
     def sync(
@@ -120,6 +140,7 @@ class WordPressSync:
         since: Optional[str] = None,
         full_resync: bool = False,
         prune: bool = False,
+        list_linked_pdfs_only: bool = False,
     ) -> SyncReport:
         """
         Run one sync pass.
@@ -129,10 +150,11 @@ class WordPressSync:
         since: ISO-8601 GMT timestamp to override the state watermark for this run.
         full_resync: if True, ignore the state file entirely (re-ingest everything).
         prune: if True, after a successful run delete any wp-* doc_ids that
-               exist in Qdrant but were not visited this run (i.e. items
-               deleted from WordPress since they were last ingested).
-               Implies full_resync - we can only safely identify orphans when
-               we've visited every current WP item.
+               exist in Qdrant but were not visited this run.
+               Implies full_resync.
+        list_linked_pdfs_only: audit mode - discover linked PDFs across all
+               currently-published WP content but neither index nor write state.
+               Forces full_resync, disables media sync, disables prune.
         """
         report = SyncReport()
         wanted = self._resolve_content_types(content_types)
@@ -144,6 +166,15 @@ class WordPressSync:
             logger.info("prune=True forces full_resync=True (orphan detection requires a complete pass)")
             full_resync = True
 
+        if list_linked_pdfs_only:
+            # Audit mode: scan all current text content for PDF links; don't ingest
+            # anything, don't write state, don't prune. Drop media from scope (it's
+            # unrelated to linked-PDF discovery and wastes a fetch).
+            full_resync = True
+            prune = False
+            wanted = [k for k in wanted if k != "media"]
+            logger.info("list-linked-pdfs mode: dry-run discovery, no writes")
+
         user_display = settings.WORDPRESS_USERNAME or "<none>"
         auth_display = "app-password" if settings.WORDPRESS_APP_PASSWORD else "anonymous"
         logger.info(
@@ -152,9 +183,21 @@ class WordPressSync:
             f"content_types={wanted} full_resync={full_resync} prune={prune}"
         )
 
+        # Reset linked-PDF queue for this run (instance is reused by APScheduler).
+        self._linked_pdfs = {}
+
+        # Whether linked-PDF discovery is in play for this run.
+        text_types_in_scope = [k for k in wanted if k != "media"]
+        do_linked_pdfs = (
+            settings.WORDPRESS_INGEST_LINKED_PDFS
+            and bool(text_types_in_scope)
+        )
+
         # Capture pre-existing wp-* doc_ids (scoped to the prefixes we're syncing)
         # so we can identify orphans after the pass.
         prefixes_in_scope: list[str] = [self._doc_prefix_for_key(k) for k in wanted]
+        if do_linked_pdfs:
+            prefixes_in_scope.append("wp-linkedpdf-")
         existing_doc_ids: set[str] = set()
         if prune:
             existing_doc_ids = self._list_doc_ids_with_prefixes(prefixes_in_scope)
@@ -197,6 +240,22 @@ class WordPressSync:
                     logger.error(f"WP sync [{key}] failed: {describe_exception(e)}")
                     logger.debug("Full traceback:", exc_info=True)
                     report.for_type(key).errors += 1
+
+            # After all text content is fetched, drain the linked-PDF queue.
+            if do_linked_pdfs:
+                logger.info(f"WP sync [linked_pdfs] starting (dry_run={list_linked_pdfs_only})")
+                try:
+                    self._process_linked_pdfs(
+                        wp,
+                        report=report.for_type("linked_pdfs"),
+                        touched=touched_doc_ids,
+                        full_resync=full_resync,
+                        dry_run=list_linked_pdfs_only,
+                    )
+                except Exception as e:
+                    logger.error(f"WP sync [linked_pdfs] failed: {describe_exception(e)}")
+                    logger.debug("Full traceback:", exc_info=True)
+                    report.for_type("linked_pdfs").errors += 1
 
         if prune:
             if report.total_errors:
@@ -272,7 +331,18 @@ class WordPressSync:
         item_id = item["id"]
         slug = item.get("slug") or str(item_id)
         title = self._html_to_text((item.get("title") or {}).get("rendered", ""))
-        body = self._html_to_text((item.get("content") or {}).get("rendered", ""))
+        raw_html = (item.get("content") or {}).get("rendered", "")
+
+        # Discover PDF links in the body BEFORE we strip HTML to plain text.
+        # We dedupe across the whole sync run via self._linked_pdfs.
+        if settings.WORDPRESS_INGEST_LINKED_PDFS and raw_html:
+            self._collect_pdf_links(
+                raw_html,
+                host_url=item.get("link") or settings.WORDPRESS_URL,
+                host_doc_id=f"{doc_prefix}-{item_id}",
+            )
+
+        body = self._html_to_text(raw_html)
         body = body.strip()
         if not body:
             logger.info(f"  skip {doc_prefix}-{item_id} ({slug}): empty body")
@@ -334,13 +404,15 @@ class WordPressSync:
 
             try:
                 pdf_bytes = wp.download_media(source_url)
+                slug = item.get("slug") or str(item_id)
+                wp_title = self._html_to_text((item.get("title") or {}).get("rendered", "")) or slug
                 chunks_indexed = self._process_pdf_bytes(
-                    item_id,
-                    item.get("slug") or str(item_id),
                     pdf_bytes,
-                    title=self._html_to_text((item.get("title") or {}).get("rendered", ""))
-                          or (item.get("slug") or str(item_id)),
+                    doc_id=f"wp-media-{item_id}",
+                    source=f"wp:media:{slug}",
+                    title=wp_title,
                     url=source_url,
+                    tmp_prefix=f"wp-media-{item_id}-",
                 )
                 report.indexed += 1
                 report.chunks += chunks_indexed
@@ -382,16 +454,23 @@ class WordPressSync:
 
     def _process_pdf_bytes(
         self,
-        item_id: int,
-        slug: str,
         pdf_bytes: bytes,
+        *,
+        doc_id: str,
+        source: str,
         title: str,
         url: str,
+        tmp_prefix: str = "wp-pdf-",
     ) -> int:
+        """
+        Generic PDF ingestion: write bytes to a temp file, run the existing
+        two-stage extractor, language-tag each page, chunk, and upsert under
+        the given doc_id. Used by both WP media items and linked PDFs.
+        """
         upload_dir = settings.upload_dir_path
         with tempfile.NamedTemporaryFile(
             dir=str(upload_dir),
-            prefix=f"wp-media-{item_id}-",
+            prefix=tmp_prefix,
             suffix=".pdf",
             delete=False,
         ) as tmp:
@@ -399,11 +478,9 @@ class WordPressSync:
             tmp_path = Path(tmp.name)
 
         try:
-            doc_id = f"wp-media-{item_id}"
             pages = self.pdf_extractor.extract(str(tmp_path))
             for p in pages:
-                # Source the PDF as wp:media:<slug> so it's visible in retrieval payloads
-                p.source = f"wp:media:{slug}"
+                p.source = source
                 p.language = detect_language(p.text)
                 p.title = title
                 p.url = url
@@ -416,7 +493,7 @@ class WordPressSync:
 
             self._delete_doc_chunks(doc_id)
             total = self.indexer.index_chunks(chunks, doc_id=doc_id)
-            logger.info(f"  indexed {doc_id} ({slug}): {total} chunks")
+            logger.info(f"  indexed {doc_id}: {total} chunks")
             return total
         finally:
             try:
@@ -515,6 +592,166 @@ class WordPressSync:
                 break
         logger.debug(f"_list_doc_ids_with_prefixes: scrolled {page} page(s), found {len(seen)} matches")
         return seen
+
+    # ----------------------- linked-PDF discovery -----------------------
+
+    def _collect_pdf_links(self, html: str, host_url: str, host_doc_id: str) -> None:
+        """Find <a href> PDFs in the post body and add to the dedupe queue."""
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            return
+        for a in soup.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            if not href or href.startswith(("#", "mailto:", "javascript:")):
+                continue
+            absolute = urljoin(host_url or settings.WORDPRESS_URL, href)
+            normalized = self._normalize_pdf_url(absolute)
+            if not normalized:
+                continue
+            if normalized in self._linked_pdfs:
+                # Already queued by an earlier post - record the additional reference.
+                self._linked_pdfs[normalized]["referenced_by"].append(host_doc_id)
+                continue
+            anchor_text = (a.get_text(" ", strip=True) or "")[:200] or None
+            self._linked_pdfs[normalized] = {
+                "url": normalized,
+                "anchor_text": anchor_text,
+                "first_seen_in": host_doc_id,
+                "referenced_by": [host_doc_id],
+            }
+
+    def _normalize_pdf_url(self, url: str) -> Optional[str]:
+        """
+        Return a canonical PDF URL on an allowed host, or None to drop.
+        - Must end in .pdf (case-insensitive), allowing for query strings
+        - Must be on an allowed host (WP host + WORDPRESS_LINKED_PDF_HOSTS)
+        - Forces https:// on the WP host so http+https variants dedupe
+        - Strips fragment; preserves query
+        """
+        try:
+            parts = urlsplit(url)
+        except Exception:
+            return None
+        if not parts.scheme or not parts.netloc:
+            return None
+        if parts.scheme.lower() not in ("http", "https"):
+            return None
+        path_lower = parts.path.lower()
+        if not path_lower.endswith(".pdf"):
+            return None
+        host = parts.netloc.lower()
+        # Strip port for host comparison
+        host_no_port = host.split(":", 1)[0]
+        if host_no_port not in self._allowed_pdf_hosts:
+            return None
+        scheme = "https"  # normalize so http/https variants of the same path dedupe
+        return urlunsplit((scheme, host, parts.path, parts.query, ""))
+
+    @staticmethod
+    def _linked_pdf_doc_id(url: str) -> str:
+        """Stable doc_id for a linked PDF: wp-linkedpdf-<sha1[:16]>."""
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+        return f"wp-linkedpdf-{digest}"
+
+    def _derive_pdf_title(self, url: str, anchor_text: Optional[str]) -> str:
+        """Prefer anchor text if meaningful; else derive from the filename stem."""
+        if anchor_text and len(anchor_text) >= 3 and not anchor_text.lower().endswith(".pdf"):
+            return anchor_text
+        filename = Path(urlsplit(url).path).name
+        stem = Path(filename).stem if filename else "document"
+        return stem.replace("-", " ").replace("_", " ")
+
+    def _chunk_exists_for_doc(self, doc_id: str) -> bool:
+        """Cheap existence check via the doc_id payload index."""
+        try:
+            result = self.qdrant.count(
+                collection_name=COLLECTION_NAME,
+                count_filter=Filter(must=[
+                    FieldCondition(key="doc_id", match=MatchValue(value=doc_id))
+                ]),
+                exact=False,
+            )
+            return result.count > 0
+        except Exception as e:
+            logger.debug(f"existence check for {doc_id} failed: {e}")
+            return False
+
+    def _process_linked_pdfs(
+        self,
+        wp: WordPressClient,
+        report: ContentTypeReport,
+        touched: set[str],
+        full_resync: bool,
+        dry_run: bool,
+    ) -> None:
+        """
+        Drain the dedupe queue. For each unique PDF URL:
+          - If --dry-run: log it and continue.
+          - Else if doc_id exists and not full_resync: mark touched, skip download.
+          - Else: download, extract, chunk, index under wp-linkedpdf-<hash>.
+        404/410 are treated as skip-permanent (file gone from server).
+        """
+        if not self._linked_pdfs:
+            logger.info("No linked PDFs discovered.")
+            return
+
+        logger.info(f"Linked PDFs: {len(self._linked_pdfs)} unique URL(s) discovered")
+
+        for url, info in sorted(self._linked_pdfs.items()):
+            report.fetched += 1
+            doc_id = self._linked_pdf_doc_id(url)
+            touched.add(doc_id)
+
+            if dry_run:
+                refs = len(info.get("referenced_by") or [])
+                logger.info(
+                    f"  [dry-run] {url}  ->  {doc_id}  "
+                    f"(refs={refs}, first_seen={info.get('first_seen_in')!r})"
+                )
+                continue
+
+            if not full_resync and self._chunk_exists_for_doc(doc_id):
+                logger.info(f"  skip {doc_id} (already indexed): {url}")
+                report.skipped += 1
+                continue
+
+            try:
+                pdf_bytes = wp.download_media(url)
+                title = self._derive_pdf_title(url, info.get("anchor_text"))
+                slug = self._derive_pdf_slug(url)
+                chunks_indexed = self._process_pdf_bytes(
+                    pdf_bytes,
+                    doc_id=doc_id,
+                    source=f"wp:linkedpdf:{slug}",
+                    title=title,
+                    url=url,
+                    tmp_prefix=f"wp-linkedpdf-{doc_id[-16:]}-",
+                )
+                report.indexed += 1
+                report.chunks += chunks_indexed
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code if e.response is not None else 0
+                if status in (404, 410):
+                    logger.warning(
+                        f"Linked PDF gone (HTTP {status}): {url}"
+                    )
+                    report.skipped += 1
+                else:
+                    logger.error(f"Linked PDF failed {url}: {describe_exception(e)}")
+                    report.errors += 1
+            except Exception as e:
+                logger.error(f"Linked PDF failed {url}: {describe_exception(e)}")
+                logger.debug("Full traceback:", exc_info=True)
+                report.errors += 1
+
+    @staticmethod
+    def _derive_pdf_slug(url: str) -> str:
+        """Slug-ish identifier for the linked PDF (used in `source` payload)."""
+        path = urlsplit(url).path
+        return path.lstrip("/").replace("/", ":") or "unknown"
+
+    # ----------------------- existing helpers -----------------------
 
     @staticmethod
     def _display_content_type(doc_prefix: str) -> str:

@@ -48,6 +48,12 @@ class Settings(BaseSettings):
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
     WORDPRESS_VERIFY_SSL: bool = True
+    # Discover PDFs linked from post/page/CPT bodies (e.g. static files served
+    # outside /wp-content/uploads/) and ingest them as separate documents.
+    WORDPRESS_INGEST_LINKED_PDFS: bool = True
+    # Extra hosts to allow PDF downloads from. The WP site's own host is always
+    # allowed; this lets you whitelist CDNs or related domains. Comma-separated.
+    WORDPRESS_LINKED_PDF_HOSTS: str = ""
 
     @property
     def upload_dir_path(self) -> Path:
