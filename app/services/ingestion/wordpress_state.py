@@ -17,6 +17,12 @@ Writes are atomic (tmp file + rename) so a crash mid-write cannot corrupt
 the file.
 """
 
+# Lazy annotations: this class defines a method named `set` (the watermark
+# setter), which shadows builtins.set within the class scope. Without lazy
+# evaluation, annotations like `-> set[str]` on later methods would try to
+# subscript the method object and raise "'function' object is not subscriptable".
+from __future__ import annotations
+
 import json
 import logging
 import os
