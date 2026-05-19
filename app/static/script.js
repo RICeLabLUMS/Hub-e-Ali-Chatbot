@@ -116,10 +116,35 @@ function renderCitations(citations) {
     if (!citations || !citations.length) return '';
     const items = citations.map(c => {
         const title = escapeHtml(c.title || 'Source');
-        const type = c.content_type ? `<span class="ha-cite-type">${escapeHtml(c.content_type)}</span>` : '';
-        const page = (c.page != null && String(c.content_type).toUpperCase() === 'PDF')
-            ? `<span class="ha-cite-page">p.&nbsp;${escapeHtml(c.page)}</span>` : '';
-        const inner = `${title}${type ? ' &middot; ' + type : ''}${page ? ' &middot; ' + page : ''}`;
+        const ct = String(c.content_type || '');
+        const ctU = ct.toUpperCase();
+
+        const bits = [];
+        if (c.content_type) bits.push(`<span class="ha-cite-type">${escapeHtml(c.content_type)}</span>`);
+        if (c.volume != null) bits.push(`<span class="ha-cite-num">Vol.&nbsp;${escapeHtml(c.volume)}</span>`);
+        if (c.page != null && ctU === 'PDF') {
+            bits.push(`<span class="ha-cite-page">p.&nbsp;${escapeHtml(c.page)}</span>`);
+        }
+        if (c.section_title) bits.push(`<span class="ha-cite-num">§${escapeHtml(c.section_title)}</span>`);
+        else if (c.chapter_num != null && c.verse_range) {
+            bits.push(`<span class="ha-cite-num">Ch.&nbsp;${escapeHtml(c.chapter_num)} v.&nbsp;${escapeHtml(c.verse_range)}</span>`);
+        } else if (c.chapter_num != null) {
+            bits.push(`<span class="ha-cite-num">Ch.&nbsp;${escapeHtml(c.chapter_num)}</span>`);
+        }
+        const refs = Array.isArray(c.refs_quran) ? c.refs_quran : [];
+        if (refs.length) {
+            const shown = refs.slice(0, 3).map(escapeHtml).join(', ');
+            const more = refs.length > 3 ? ` +${refs.length - 3}` : '';
+            bits.push(`<span class="ha-cite-num">Quran&nbsp;${shown}${more}</span>`);
+        }
+        const hadith = Array.isArray(c.hadith_refs) ? c.hadith_refs : [];
+        if (hadith.length) {
+            const shown = hadith.slice(0, 3).map(escapeHtml).join(', ');
+            const more = hadith.length > 3 ? ` +${hadith.length - 3}` : '';
+            bits.push(`<span class="ha-cite-num">${shown}${more}</span>`);
+        }
+
+        const inner = title + (bits.length ? ' &middot; ' + bits.join(' &middot; ') : '');
         return c.url
             ? `<a class="ha-cite" href="${escapeHtml(c.url)}" target="_blank" rel="noopener noreferrer">${inner}</a>`
             : `<span class="ha-cite">${inner}</span>`;

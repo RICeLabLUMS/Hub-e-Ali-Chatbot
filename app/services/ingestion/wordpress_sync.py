@@ -42,6 +42,11 @@ from app.core.dependencies import (
     get_qdrant_client,
 )
 from app.services.ingestion.chunker import MultilingualChunker
+from app.services.ingestion.citation_extractor import (
+    extract_chapter_from_title,
+    extract_verse_range_from_title,
+    extract_volume,
+)
 from app.services.ingestion.indexer import QdrantIndexer
 from app.services.ingestion.language_detector import detect_language
 from app.services.ingestion.pdf_extractor import ExtractedPage
@@ -447,6 +452,10 @@ class WordPressSync:
         combined = f"{title}\n\n{body}" if title else body
 
         doc_id = f"{doc_prefix}-{item_id}"
+        # Doc-level citations parsed from the post title (e.g.
+        # "AL-ANFAAL (Chapter 8) Verses 1-40" -> chapter_num=8, verse_range="1-40").
+        chapter_num = extract_chapter_from_title(title) if title else None
+        verse_range = extract_verse_range_from_title(title) if title else None
         page = ExtractedPage(
             text=combined,
             page_number=1,
@@ -455,6 +464,8 @@ class WordPressSync:
             title=title or slug,
             url=item.get("link") or None,
             content_type=self._display_content_type(doc_prefix),
+            chapter_num=chapter_num,
+            verse_range=verse_range,
         )
         page.language = detect_language(page.text)
 
@@ -574,12 +585,17 @@ class WordPressSync:
 
         try:
             pages = self.pdf_extractor.extract(str(tmp_path))
+            # Doc-level volume parsed from the title or URL filename. Same for
+            # every page of this PDF; per-page numbers are already set by the
+            # extractor as page.page_number.
+            volume = extract_volume(title) or extract_volume(url)
             for p in pages:
                 p.source = source
                 p.language = detect_language(p.text)
                 p.title = title
                 p.url = url
                 p.content_type = "PDF"
+                p.volume = volume
 
             chunks = self.chunker.chunk_pages(pages, doc_id=doc_id)
             if not chunks:

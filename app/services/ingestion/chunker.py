@@ -7,6 +7,11 @@ from chonkie import SemanticChunker
 from chonkie.embeddings import SentenceTransformerEmbeddings
 from sentence_transformers import SentenceTransformer
 
+from app.services.ingestion.citation_extractor import (
+    extract_hadith_refs,
+    extract_quran_refs,
+    extract_section_title,
+)
 from app.services.ingestion.language_detector import split_by_language
 
 logger = logging.getLogger(__name__)
@@ -27,6 +32,14 @@ class Chunk:
     title: Optional[str] = None
     url: Optional[str] = None
     content_type: Optional[str] = None
+    # Numeric citations - some inherited from the page (doc-level), some
+    # extracted per chunk after the chunker has split the text.
+    chapter_num: Optional[int] = None        # doc-level (inherited)
+    verse_range: Optional[str] = None        # doc-level (inherited)
+    volume: Optional[int] = None             # doc-level (inherited)
+    refs_quran: Optional[list[str]] = None   # chunk-level: ["8:1", "8:5-8"]
+    section_title: Optional[str] = None      # chunk-level: "VERSE 1" / "Sermon 17"
+    hadith_refs: Optional[list[str]] = None  # chunk-level: ["Vol. 1 H. 245", "Sermon 17"]
 
 
 class MultilingualChunker:
@@ -110,6 +123,13 @@ class MultilingualChunker:
                             dropped += 1
                             continue
 
+                        # Per-chunk numeric citations - run AFTER chunking
+                        # so each chunk gets refs/section relevant to its
+                        # own slice of the page text.
+                        refs = extract_quran_refs(chunk_text) or None
+                        section = extract_section_title(chunk_text)
+                        hadith = extract_hadith_refs(chunk_text) or None
+
                         chunk = Chunk(
                             text=chunk_text,
                             chunk_id=f"{doc_id}__p{page.page_number}__s{seg_idx}_{sub_idx}__c{i}",
@@ -123,6 +143,14 @@ class MultilingualChunker:
                             title=getattr(page, "title", None),
                             url=getattr(page, "url", None),
                             content_type=getattr(page, "content_type", None),
+                            # Doc-level fields inherited from the page.
+                            chapter_num=getattr(page, "chapter_num", None),
+                            verse_range=getattr(page, "verse_range", None),
+                            volume=getattr(page, "volume", None),
+                            # Chunk-level fields extracted just now.
+                            refs_quran=refs,
+                            section_title=section,
+                            hadith_refs=hadith,
                         )
                         all_chunks.append(chunk)
 

@@ -105,6 +105,10 @@ class ExtractedPage:
     title: Optional[str] = None
     url: Optional[str] = None
     content_type: Optional[str] = None
+    # Doc-level numeric citations (set once per source, inherited by all chunks).
+    chapter_num: Optional[int] = None       # Quran surah, book chapter
+    verse_range: Optional[str] = None       # e.g. "1-40" - canonical from title
+    volume: Optional[int] = None            # multi-volume books
 
 
 class PDFExtractor:

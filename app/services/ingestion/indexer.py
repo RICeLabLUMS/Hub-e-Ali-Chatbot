@@ -143,6 +143,13 @@ class QdrantIndexer:
                     "title": chunk.title,
                     "url": chunk.url,
                     "content_type": chunk.content_type,
+                    # Numeric citations
+                    "chapter_num": chunk.chapter_num,
+                    "verse_range": chunk.verse_range,
+                    "volume": chunk.volume,
+                    "refs_quran": chunk.refs_quran,
+                    "section_title": chunk.section_title,
+                    "hadith_refs": chunk.hadith_refs,
                 },
             ))
 

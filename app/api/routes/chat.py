@@ -205,20 +205,60 @@ async def chat_stats():
 
 
 def _build_citation(chunk: dict) -> dict:
-    """Shape one chunk's payload into a display-ready citation dict."""
+    """
+    Shape one chunk's payload into a display-ready citation dict.
+
+    Label format prefers numeric anchors when available:
+      "AL-ANFAAL Chapter 8 — Article · §VERSE 1 · Quran 8:1"
+      "Al-Kafi — PDF · Vol. 8, p. 42"
+      "Nahjul Balagha — PDF · §Sermon 17 · p. 88"
+      "Tawheed concept — Article"             (no numbers found)
+    """
     title = chunk.get("title") or chunk.get("source") or "Unknown"
     content_type = chunk.get("content_type") or ""
     page = chunk.get("page")
     url = chunk.get("url")
 
-    parts = [title]
+    volume = chunk.get("volume")
+    section = chunk.get("section_title")
+    refs = chunk.get("refs_quran") or []
+    hadith = chunk.get("hadith_refs") or []
+    chapter_num = chunk.get("chapter_num")
+    verse_range = chunk.get("verse_range")
+
+    parts: list[str] = [title]
+
+    # Type + page/volume cluster
     if content_type:
-        suffix = content_type
-        if content_type.upper() == "PDF" and page:
-            suffix = f"{content_type}, p. {page}"
-        parts.append(suffix)
+        type_bits = [content_type]
+        if volume is not None:
+            type_bits.append(f"Vol. {volume}")
+        if page is not None and content_type.upper() == "PDF":
+            type_bits.append(f"p. {page}")
+        parts.append(", ".join(type_bits))
     elif page is not None:
         parts.append(f"p. {page}")
+
+    # Section / chapter / verse range
+    if section:
+        parts.append(f"§{section}")
+    elif chapter_num is not None and verse_range:
+        parts.append(f"Ch. {chapter_num} v. {verse_range}")
+    elif chapter_num is not None:
+        parts.append(f"Ch. {chapter_num}")
+
+    # Quran references (cap at 3 to keep labels readable)
+    if refs:
+        refs_display = refs[:3]
+        more = "" if len(refs) <= 3 else f" +{len(refs) - 3}"
+        parts.append(f"Quran {', '.join(refs_display)}{more}")
+
+    # Hadith / sermon / letter refs (also capped at 3).
+    if hadith:
+        hadith_display = hadith[:3]
+        h_more = "" if len(hadith) <= 3 else f" +{len(hadith) - 3}"
+        parts.append(f"{', '.join(hadith_display)}{h_more}")
+
     label = " — ".join(parts)
 
     return {
@@ -228,5 +268,11 @@ def _build_citation(chunk: dict) -> dict:
         "page": page,
         "url": url,
         "source": chunk.get("source"),
+        "volume": volume,
+        "section_title": section,
+        "chapter_num": chapter_num,
+        "verse_range": verse_range,
+        "refs_quran": refs,
+        "hadith_refs": hadith,
         "label": label,
     }

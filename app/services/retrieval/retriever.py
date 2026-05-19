@@ -91,6 +91,13 @@ class HybridRetriever:
                 "title": r.payload.get("title"),
                 "url": r.payload.get("url"),
                 "content_type": r.payload.get("content_type"),
+                # Numeric citations
+                "chapter_num": r.payload.get("chapter_num"),
+                "verse_range": r.payload.get("verse_range"),
+                "volume": r.payload.get("volume"),
+                "refs_quran": r.payload.get("refs_quran") or [],
+                "section_title": r.payload.get("section_title"),
+                "hadith_refs": r.payload.get("hadith_refs") or [],
                 "score": r.score,
             }
             for r in results.points

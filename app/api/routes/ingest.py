@@ -15,6 +15,7 @@ from app.core.dependencies import (
 )
 from app.core.security import verify_api_key
 from app.services.ingestion.chunker import MultilingualChunker
+from app.services.ingestion.citation_extractor import extract_volume
 from app.services.ingestion.indexer import QdrantIndexer
 from app.services.ingestion.language_detector import detect_language
 
@@ -80,10 +81,12 @@ async def _process_pdf(doc_id: str, payload: dict, status_cb: Callable[[dict], N
         # Tag each page with detected language (rough — chunker refines per segment)
         # and display metadata used by the chat-side citation renderer.
         title_from_filename = os.path.splitext(os.path.basename(filename))[0]
+        volume = extract_volume(title_from_filename)
         for page in pages:
             page.language = detect_language(page.text)
             page.title = title_from_filename
             page.content_type = "PDF"
+            page.volume = volume
 
         status_cb({"message": "Chunking"})
         embedder = get_embedder()

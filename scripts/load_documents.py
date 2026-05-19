@@ -73,6 +73,7 @@ async def load_offline(folder: Path) -> None:
     """Run the full ingestion pipeline in-process — no HTTP server needed."""
     from app.core.dependencies import get_embedder, get_pdf_extractor, get_qdrant_client
     from app.services.ingestion.chunker import MultilingualChunker
+    from app.services.ingestion.citation_extractor import extract_volume
     from app.services.ingestion.indexer import QdrantIndexer
     from app.services.ingestion.language_detector import detect_language
     from app.services.qdrant_setup import setup_collection
@@ -95,10 +96,12 @@ async def load_offline(folder: Path) -> None:
 
         pages = extractor.extract(str(pdf))
         # Display metadata: local files have no canonical URL, so url stays None.
+        volume = extract_volume(pdf.stem)
         for p in pages:
             p.language = detect_language(p.text)
             p.title = pdf.stem
             p.content_type = "PDF"
+            p.volume = volume
 
         chunks = chunker.chunk_pages(pages, doc_id=doc_id)
         total = indexer.index_chunks(chunks, doc_id=doc_id)

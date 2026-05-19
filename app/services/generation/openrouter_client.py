@@ -30,10 +30,17 @@ ANSWER_SYSTEM_TEMPLATE = (
     '{{"answer": "<answer in {lang_name}>", "citations": [{{"chunk_id": "..."}}]}}\n\n'
     "Rules:\n"
     "- Use ONLY the provided context. Never invent facts.\n"
-    "- If the context does not answer the question, return:\n"
-    '  {{"answer": "I don\'t know based on the provided sources.", "citations": []}}\n'
-    "- Cite ONLY chunk_ids that are listed in the context.\n"
-    "- Output JSON only. No prose, no markdown fences."
+    "- If the context does not directly answer the question but contains "
+    "  related material on the same topic, synthesize an answer from it.\n"
+    "- Only return \"I don't know based on the provided sources.\" if NO chunk "
+    "  contains material relevant to the question's topic.\n"
+    "- When the chunk metadata includes chapter, verses, volume, section, "
+    "  page or quran_refs, weave those numbers into the prose - e.g. "
+    "  'In Surah Al-Anfaal verse 5...', 'Al-Kafi Vol. 8, p. 42...', "
+    "  'Sermon 17 of Nahjul Balagha states...'. Do NOT cite chunk_ids in prose.\n"
+    "- The citations array must list ONLY chunk_ids that are present in the "
+    "  context block (verbatim).\n"
+    "- Output JSON only. No prose outside the JSON, no markdown fences."
 )
 
 
@@ -254,6 +261,12 @@ class OpenRouterClient:
 
     @staticmethod
     def _format_context(chunks: list[dict]) -> str:
+        """
+        Build the CONTEXT block for the system prompt. Each chunk is annotated
+        with the metadata fields the LLM should weave into its prose so the
+        answer cites by number ("Quran 8:5", "Sermon 17, p. 42") rather than
+        opaque chunk_ids.
+        """
         blocks = []
         for c in chunks:
             header_parts = [f"chunk_id={c.get('chunk_id')}"]
@@ -261,6 +274,22 @@ class OpenRouterClient:
                 header_parts.append(f"title={c['title']!r}")
             if c.get("content_type"):
                 header_parts.append(f"type={c['content_type']}")
+            # Numeric citations - the LLM is encouraged (in the system prompt)
+            # to use these in the prose, not just at the end.
+            if c.get("chapter_num") is not None:
+                header_parts.append(f"chapter={c['chapter_num']}")
+            if c.get("verse_range"):
+                header_parts.append(f"verses={c['verse_range']}")
+            if c.get("volume") is not None:
+                header_parts.append(f"volume={c['volume']}")
+            if c.get("section_title"):
+                header_parts.append(f"section={c['section_title']!r}")
+            refs = c.get("refs_quran") or []
+            if refs:
+                header_parts.append(f"quran_refs={','.join(refs)}")
+            hadith = c.get("hadith_refs") or []
+            if hadith:
+                header_parts.append(f"hadith_refs={'; '.join(hadith)}")
             if c.get("page") is not None:
                 header_parts.append(f"page={c['page']}")
             header_parts.append(f"source={c.get('source')}")
